@@ -1,0 +1,13 @@
+# Runtime diagnostics
+rocket-request-tracer/
+trace-*.php
+*.jsonl
+*.log
+
+# Build artifacts
+*.zip
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
