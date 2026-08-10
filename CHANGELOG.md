@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.0
+
+- Made the MU bootstrap a mandatory part of Request Monitor rather than an optional roadmap item.
+- Added automatic MU bridge installation on plugin activation.
+- Added fail-closed activation when `wp-content/mu-plugins` cannot be created or written.
+- Added automatic MU bridge health/version repair from WordPress admin.
+- Added a manual **Repair MU bridge** control.
+- Disabled tracing controls when the required MU bridge is missing or outdated.
+- Added safe MU bridge cleanup on plugin deactivation.
+- Moved request START ownership to the MU bootstrap so tracing begins before normal plugins load.
+- Moved request END ownership to the MU bootstrap so the same early request context survives through shutdown.
+- Added a finalizer handoff from MU bootstrap to the regular plugin for WordPress-aware enrichment.
+- Added lifecycle phase timestamps and durations for regular plugin load, `plugins_loaded`, `after_setup_theme`, `init`, `wp_loaded`, request parsing, `wp`, REST/admin initialization, `template_redirect`, and shutdown.
+- Enabled `$wpdb->save_queries` from MU-plugin load time when Deep attribution is enabled, increasing SQL coverage.
+- Added WordPress request context at shutdown, including admin/AJAX/cron/REST state and main-query characteristics.
+- Added cron and AJAX markers to the early START event.
+- Preserved PID, Cloudflare Ray, safe query, CPU/wall classification, memory, `/proc/self/io`, `getrusage()`, included-code ownership, SQL attribution, outbound HTTP attribution, and live `ps`/`strace`/`phpspy`/`lsof` escalation.
+
 ## 0.2.0
 
 - Added CPU/wall request classification.
