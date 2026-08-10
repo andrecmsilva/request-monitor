@@ -2,127 +2,147 @@
 
 ## Goal
 
-Rocket Request Tracer is designed to answer a specific operational question:
+Request Monitor answers one operational question:
 
-> When the LSAPI/PHP worker pool is saturated, what exact HTTP request is each worker serving, and what is that request doing with its lifetime?
+> When the PHP/LSAPI worker pool is saturated, which exact request owns each worker, and what is that request doing with its lifetime?
 
-The project deliberately sits between edge/request observability and full APM.
+## v0.3.0 foundation
 
-## Data flow
+The MU bootstrap is mandatory and owns the request lifecycle.
 
-### START event
+```text
+wp-content/mu-plugins/request-monitor-bootstrap.php
+        ↓
+START: PID + request identity + resource baseline
+        ↓
+normal plugins load
+        ↓
+Request Monitor attaches enrichment callbacks
+        ↓
+WordPress lifecycle / SQL / HTTP / query context
+        ↓
+MU shutdown
+        ↓
+END: resource delta + classification + enrichment
+```
 
-When WordPress loads the plugin for a traced web request, the plugin creates a request ID and records:
+The regular plugin bundles the MU source under `mu/request-monitor-bootstrap.php`, installs it during activation, verifies its hash from WordPress admin, and repairs it when the bundled version changes.
 
+Tracing is intentionally unavailable when the bridge is unhealthy.
+
+## START event
+
+The MU layer records the earliest Request Monitor event available inside WordPress's MU-plugin stage:
+
+- request ID
 - PID / PPID / UID
-- request metadata
-- Cloudflare metadata
-- selected safe parameters
-- initial CPU/resource snapshot
+- method / host / path
+- Cloudflare Ray ID and connecting IP
+- safe diagnostic query parameters
+- WordPress/WooCommerce AJAX action
+- content type/length
+- user agent / referer
+- cron/AJAX state
+- CPU and `/proc/self/io` baseline
 
-The START record is written immediately.
+The request ID and PID remain stable through the rest of that PHP request.
 
-This means a request still executing during an incident can be correlated with its current PID.
+## Shared request context
 
-### END event
+The MU layer stores the active context in `$GLOBALS['rrt_bootstrap_context']`.
 
-A shutdown function records:
+The regular plugin attaches a finalizer callback and lifecycle marks to this context instead of creating a second independent trace.
 
-- status
+This avoids conflicting START/END ownership and preserves one deterministic request record.
+
+## Lifecycle marks
+
+Where applicable, the regular plugin records timestamps for:
+
+- regular plugin load
+- `plugins_loaded`
+- `after_setup_theme`
+- `init`
+- `wp_loaded`
+- `parse_request`
+- `wp`
+- `rest_api_init`
+- `admin_init`
+- `template_redirect`
+
+The MU shutdown converts those marks into phase-to-phase durations.
+
+These measurements are not a function profiler, but they narrow the execution window that consumed the request.
+
+## END event
+
+The MU shutdown handler records:
+
 - wall duration
-- CPU duration
+- user/system/total CPU
 - CPU/wall ratio
-- memory
+- classification
+- peak/end PHP memory
 - resource deltas
-- included code
-- optional SQL summary
-- optional outbound HTTP summary
-- fatal shutdown information
+- lifecycle timestamps and durations
+- included PHP file count
+- connection-aborted state
+- fatal shutdown error when present
 
-A START without a matching END in the active log window is shown as `ACTIVE`.
-
-## Why PID correlation matters
-
-LSAPI workers are persistent and may serve multiple requests during their lifetime.
-
-The worker lifetime shown by `ps` therefore does not equal the runtime of the current HTTP request.
-
-The trace associates each current request with the PID that accepted it.
-
-## Classification
-
-The first-order classifier uses CPU time divided by wall time.
-
-This intentionally answers one narrow question first:
-
-> Was PHP actively using CPU, or was it mostly waiting?
-
-Thresholds are heuristic, not universal truths.
-
-### CPU_BOUND
-
-High CPU/wall ratio.
-
-Typical follow-up:
-
-- PHP stack sampling
-- plugin/theme logic
-- expensive loops
-- serialization
-- regex
-- product filtering/calculation
-- application-level computation
-
-### WAIT_BOUND
-
-Low CPU/wall ratio.
-
-Typical follow-up:
-
-- SQL
-- outbound HTTP
-- Redis
-- filesystem
-- sockets
-- locks
-- upstream service waits
-
-### MIXED
-
-Both classes materially contribute.
+It then merges the regular plugin's WordPress-aware enrichment.
 
 ## Deep attribution
 
-Deep attribution instruments WordPress-level facilities.
+When Deep mode is active, the MU bootstrap enables `$wpdb->save_queries` before normal plugins load. This increases SQL coverage compared with enabling it from a standard plugin.
+
+The regular plugin adds:
 
 ### SQL
 
-WordPress query saving provides:
+- query count
+- total SQL duration
+- slowest queries
+- normalized/redacted query shape
+- query hash
+- WordPress caller information
 
-- query text
-- query duration
-- caller information
-
-The tracer normalizes common literal values before persisting SQL.
-
-### HTTP API
-
-The plugin hooks the WordPress HTTP API and captures:
+### WordPress HTTP API
 
 - destination without query string
-- elapsed time
-- result
+- duration
+- response/error
 - caller summary
+- transport class
 
-This will not catch networking performed outside the WordPress HTTP API.
+### WordPress context
 
-## OS-level escalation
+- admin/AJAX/cron/REST state
+- PHP and WordPress versions
+- memory limit
+- main-query characteristics
+- post/found-post counts when available
 
-A plugin cannot replace privileged process inspection.
+### Included-code ownership
 
-The dashboard therefore treats the PID as an escalation handle.
+Files are grouped by WordPress core, MU plugin, regular plugin, theme, or other code.
 
-Useful tools:
+This is contextual evidence, not CPU attribution.
+
+## Classification
+
+The first-order classifier intentionally answers one narrow question:
+
+> Was the PHP request actively using CPU, or mostly waiting?
+
+- `FAST`: wall < 750 ms
+- `CPU_BOUND`: CPU/wall >= ~70%
+- `WAIT_BOUND`: CPU/wall <= ~25%
+- `MIXED`: between those thresholds
+- `ACTIVE`: START exists without matching END yet
+
+## PID escalation
+
+For ACTIVE requests, the PID is the escalation handle for host-level tools:
 
 ```bash
 ps -p PID -o pid,ppid,user,stat,etime,time,%cpu,%mem,rss,wchan:32,cmd
@@ -140,36 +160,20 @@ lsof -nP -p PID
 sudo phpspy --pid=PID --limit=200
 ```
 
-The intended model is:
+The intended investigation chain is:
 
 ```text
-plugin evidence
-    ↓
-identify exact live PID
-    ↓
-host-level inspection only when necessary
+request → CF-Ray → PID → lifecycle → CPU/I/O → SQL/HTTP → live PHP stack
 ```
 
-## Security model
+## Remaining blind spots
 
-The tracer stores diagnostics under WordPress content storage, so it adds multiple protections:
+The MU bootstrap starts earlier than a normal plugin, but it still starts after WordPress has begun loading core bootstrap code. `auto_prepend_file` would be required for visibility before WordPress itself.
 
-1. randomized log filename
-2. `.php` extension
-3. immediate `exit`
-4. `__halt_compiler()`
-5. `.htaccess` deny rule
-6. authenticated/nonced download action
+Other blind spots include:
 
-The plugin still treats logs as sensitive diagnostics.
-
-## Known blind spots
-
-- PHP activity before normal plugin loading
-- direct socket/network calls that bypass WordPress HTTP API
-- database calls that bypass `$wpdb`
-- executing function stack of another PID
-- kernel/system-wide contention outside current process statistics
-- full MySQL server-side query state
-
-Those are intentionally delegated to future integrations or host-level tooling.
+- network calls that bypass the WordPress HTTP API
+- database access that bypasses `$wpdb`
+- the live PHP stack of another worker without privileged host tools
+- system-wide contention outside the current process
+- server-side MySQL state not exposed through WordPress
