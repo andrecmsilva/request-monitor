@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Request Monitor
- * Description: Request-to-PID diagnostics for WordPress with a mandatory MU bootstrap, CPU/wait classification, SQL/HTTP attribution, lifecycle timing, and live process escalation.
- * Version: 0.3.0
+ * Description: Request-to-PID diagnostics for WordPress with mandatory MU bootstrap, automatic slow-request escalation, hook/callback timing, SQL/HTTP attribution, and live process escalation.
+ * Version: 0.4.0
  * Author: Internal Diagnostics
  */
 
@@ -11,13 +11,14 @@ if (!defined('ABSPATH')) {
 }
 
 final class Rocket_Request_Tracer {
-    const VERSION = '0.3.0';
-    const MU_VERSION = '0.3.0';
+    const VERSION = '0.4.0';
+    const MU_VERSION = '0.4.0';
     const OPT_ENABLED = 'rrt_enabled';
     const OPT_DEEP = 'rrt_deep_attribution';
     const OPT_MAX_MB = 'rrt_max_log_mb';
+    const OPT_SLOW_MS = 'rrt_slow_threshold_ms';
+    const OPT_CALLBACK_FLOOR = 'rrt_callback_floor_ms';
     const NONCE = 'rrt_admin_action';
-    const MU_FILENAME = 'request-monitor-bootstrap.php';
 
     private static $instance = null;
     private $http_calls = array();
@@ -40,51 +41,66 @@ final class Rocket_Request_Tracer {
         if ($this->has_trace_context()) $this->attach_to_mu_context();
     }
 
+    private static function mu_files() {
+        return array('request-monitor-bootstrap.php', 'request-monitor-hook-profiler.php');
+    }
+
     public static function activate() {
         $result = self::install_mu_bridge();
         if (is_wp_error($result)) {
             deactivate_plugins(plugin_basename(__FILE__));
             wp_die(
-                '<h1>Request Monitor activation failed</h1><p>' . esc_html($result->get_error_message()) . '</p><p>The MU bootstrap is mandatory and must be writable under <code>wp-content/mu-plugins</code>.</p>',
+                '<h1>Request Monitor activation failed</h1><p>' . esc_html($result->get_error_message()) . '</p><p>The mandatory MU components must be writable under <code>wp-content/mu-plugins</code>.</p>',
                 'Request Monitor', array('back_link' => true)
             );
         }
+        add_option(self::OPT_SLOW_MS, 1500, '', false);
+        add_option(self::OPT_CALLBACK_FLOOR, 5, '', false);
     }
 
     public static function deactivate() {
         update_option(self::OPT_ENABLED, 0, false);
-        $target = self::mu_target_path();
-        if (is_file($target)) {
+        foreach (self::mu_files() as $file) {
+            $target = self::mu_target_path($file);
+            if (!is_file($target)) continue;
             $head = @file_get_contents($target, false, null, 0, 512);
-            if (is_string($head) && strpos($head, 'Request Monitor Bootstrap') !== false) @unlink($target);
+            if (is_string($head) && strpos($head, 'Request Monitor') !== false) @unlink($target);
         }
     }
 
-    private static function mu_source_path() {
-        return plugin_dir_path(__FILE__) . 'mu/' . self::MU_FILENAME;
+    private static function mu_source_path($file) {
+        return plugin_dir_path(__FILE__) . 'mu/' . $file;
     }
 
-    private static function mu_target_path() {
+    private static function mu_target_path($file) {
         $dir = defined('WPMU_PLUGIN_DIR') ? WPMU_PLUGIN_DIR : WP_CONTENT_DIR . '/mu-plugins';
-        return trailingslashit($dir) . self::MU_FILENAME;
+        return trailingslashit($dir) . $file;
     }
 
     private static function install_mu_bridge() {
-        $source = self::mu_source_path();
-        $target = self::mu_target_path();
-        $dir = dirname($target);
-        if (!is_file($source)) return new WP_Error('rrt_mu_source_missing', 'Bundled MU bootstrap is missing from the plugin package.');
-        if (!is_dir($dir) && !wp_mkdir_p($dir)) return new WP_Error('rrt_mu_dir', 'Could not create the MU plugin directory: ' . $dir);
-        if (!is_writable($dir) && !is_writable($target)) return new WP_Error('rrt_mu_permissions', 'The MU plugin directory is not writable: ' . $dir);
-        $source_hash = @hash_file('sha256', $source);
-        $target_hash = is_file($target) ? @hash_file('sha256', $target) : null;
-        if ($source_hash && $target_hash === $source_hash) return true;
-        $tmp = $target . '.tmp-' . getmypid();
-        if (!@copy($source, $tmp)) return new WP_Error('rrt_mu_copy', 'Could not copy the MU bootstrap into wp-content/mu-plugins.');
-        @chmod($tmp, 0644);
-        if (!@rename($tmp, $target)) {
-            @unlink($tmp);
-            return new WP_Error('rrt_mu_rename', 'Could not atomically install the MU bootstrap.');
+        $dir = defined('WPMU_PLUGIN_DIR') ? WPMU_PLUGIN_DIR : WP_CONTENT_DIR . '/mu-plugins';
+        if (!is_dir($dir) && !wp_mkdir_p($dir)) {
+            return new WP_Error('rrt_mu_dir', 'Could not create the MU plugin directory: ' . $dir);
+        }
+
+        foreach (self::mu_files() as $file) {
+            $source = self::mu_source_path($file);
+            $target = self::mu_target_path($file);
+            if (!is_file($source)) return new WP_Error('rrt_mu_source_missing', 'Bundled MU component is missing: ' . $file);
+            if (!is_writable($dir) && !(is_file($target) && is_writable($target))) {
+                return new WP_Error('rrt_mu_permissions', 'The MU plugin directory is not writable: ' . $dir);
+            }
+            $source_hash = @hash_file('sha256', $source);
+            $target_hash = is_file($target) ? @hash_file('sha256', $target) : null;
+            if ($source_hash && $target_hash === $source_hash) continue;
+
+            $tmp = $target . '.tmp-' . getmypid();
+            if (!@copy($source, $tmp)) return new WP_Error('rrt_mu_copy', 'Could not copy MU component: ' . $file);
+            @chmod($tmp, 0644);
+            if (!@rename($tmp, $target)) {
+                @unlink($tmp);
+                return new WP_Error('rrt_mu_rename', 'Could not atomically install MU component: ' . $file);
+            }
         }
         return true;
     }
@@ -95,9 +111,13 @@ final class Rocket_Request_Tracer {
     }
 
     private function mu_healthy() {
-        $source = self::mu_source_path();
-        $target = self::mu_target_path();
-        return is_file($source) && is_file($target) && @hash_file('sha256', $source) === @hash_file('sha256', $target);
+        foreach (self::mu_files() as $file) {
+            $source = self::mu_source_path($file);
+            $target = self::mu_target_path($file);
+            if (!is_file($source) || !is_file($target)) return false;
+            if (@hash_file('sha256', $source) !== @hash_file('sha256', $target)) return false;
+        }
+        return true;
     }
 
     private function has_trace_context() {
@@ -107,6 +127,7 @@ final class Rocket_Request_Tracer {
     private function attach_to_mu_context() {
         $this->mark_phase('regular_plugin_loaded');
         $GLOBALS['rrt_bootstrap_context']['finalizer'] = array($this, 'build_end_enrichment');
+
         add_action('plugins_loaded', function () { $this->mark_phase('plugins_loaded'); }, PHP_INT_MAX);
         add_action('after_setup_theme', function () { $this->mark_phase('after_setup_theme'); }, PHP_INT_MAX);
         add_action('init', function () { $this->mark_phase('init'); }, PHP_INT_MAX);
@@ -116,10 +137,9 @@ final class Rocket_Request_Tracer {
         add_action('template_redirect', function () { $this->mark_phase('template_redirect'); }, PHP_INT_MAX);
         add_action('admin_init', function () { $this->mark_phase('admin_init'); }, PHP_INT_MAX);
         add_action('rest_api_init', function () { $this->mark_phase('rest_api_init'); }, PHP_INT_MAX);
-        if (!empty($GLOBALS['rrt_bootstrap_context']['deep'])) {
-            add_filter('http_request_args', array($this, 'http_request_start'), -9999, 2);
-            add_action('http_api_debug', array($this, 'http_request_end'), 9999, 5);
-        }
+
+        add_filter('http_request_args', array($this, 'http_request_start'), -9999, 2);
+        add_action('http_api_debug', array($this, 'http_request_end'), 9999, 5);
     }
 
     private function mark_phase($name) {
@@ -158,13 +178,22 @@ final class Rocket_Request_Tracer {
     }
 
     public function build_end_enrichment() {
-        $deep = $this->has_trace_context() && !empty($GLOBALS['rrt_bootstrap_context']['deep']);
+        $ctx = $this->has_trace_context() ? $GLOBALS['rrt_bootstrap_context'] : array();
+        $deep = !empty($ctx['deep']);
+        $escalated = !empty($ctx['auto_escalated']);
+        $collect_detail = $deep || $escalated;
+
         return array(
             'plugin_version'=>self::VERSION,
             'wordpress'=>$this->wordpress_context(),
             'included_groups'=>$this->included_file_groups(),
-            'sql'=>$deep?$this->sql_summary():array('count'=>null,'total_ms'=>null,'top'=>array()),
-            'http'=>$deep?$this->http_summary():array('count'=>null,'total_ms'=>null,'top'=>array()),
+            'sql'=>$collect_detail?$this->sql_summary():array('count'=>null,'total_ms'=>null,'top'=>array(),'coverage'=>'not_enabled'),
+            'http'=>$collect_detail?$this->http_summary():array('count'=>count($this->http_calls),'total_ms'=>$this->http_total_ms(),'top'=>array(),'coverage'=>'summary_only'),
+            'deep_coverage'=>array(
+                'mode'=>$deep?'from_start':($escalated?'post_threshold':'basic'),
+                'sql_started_from_request_start'=>$deep,
+                'http_started_from_request_start'=>true,
+            ),
         );
     }
 
@@ -207,7 +236,7 @@ final class Rocket_Request_Tracer {
 
     private function sql_summary() {
         global $wpdb;
-        $result=array('count'=>0,'total_ms'=>0,'top'=>array());
+        $result=array('count'=>0,'total_ms'=>0,'top'=>array(),'coverage'=>!empty($GLOBALS['rrt_bootstrap_context']['deep'])?'from_start':'post_threshold');
         if (!isset($wpdb->queries)||!is_array($wpdb->queries)) return $result;
         $rows=array();
         foreach ($wpdb->queries as $entry) {
@@ -234,11 +263,15 @@ final class Rocket_Request_Tracer {
         return substr($sql,0,1200);
     }
 
+    private function http_total_ms() {
+        $total=0; foreach($this->http_calls as $call) $total += $call['duration_ms'];
+        return round($total,3);
+    }
+
     private function http_summary() {
         $calls=$this->http_calls;
         usort($calls,function($a,$b){return $b['duration_ms']<=>$a['duration_ms'];});
-        $total=0; foreach($calls as $call) $total += $call['duration_ms'];
-        return array('count'=>count($calls),'total_ms'=>round($total,3),'top'=>array_slice($calls,0,10));
+        return array('count'=>count($calls),'total_ms'=>$this->http_total_ms(),'top'=>array_slice($calls,0,10),'coverage'=>'from_start');
     }
 
     private function sanitize_url($url) {
@@ -280,12 +313,12 @@ final class Rocket_Request_Tracer {
             $rows[]=array(
                 'id'=>$id,'state'=>$e?'DONE':'ACTIVE','timestamp'=>$s['timestamp']??'','pid'=>$s['pid']??0,'method'=>$s['method']??'','path'=>$s['path']??'',
                 'action'=>$s['wp_action']??($s['wc_ajax']??''),'query'=>$s['safe_query']??array(),'ip'=>$s['client_ip']??'','ray'=>$s['cf_ray']??'',
-                'class'=>$e['classification']??'ACTIVE','wall'=>$e['wall_ms']??null,'cpu'=>$e['cpu_total_ms']??null,'ratio'=>$e['cpu_ratio']??null,
-                'memory'=>$e['peak_memory_mb']??null,'files'=>$e['included_files']??null,'phases'=>$e['phase_durations']??array(),
-                'sql'=>$e['sql']??array(),'http'=>$e['http']??array(),'groups'=>$e['included_groups']??array(),'resources'=>$e['resources']??array(),'wp'=>$e['wordpress']??array(),
+                'class'=>$e['classification']??'ACTIVE','slow'=>$e['slow_request']??false,'capture'=>$e['capture_level']??($e?'legacy':'active'),'wall'=>$e['wall_ms']??null,'cpu'=>$e['cpu_total_ms']??null,'ratio'=>$e['cpu_ratio']??null,
+                'memory'=>$e['peak_memory_mb']??null,'files'=>$e['included_files']??null,'phases'=>$e['phase_durations']??array(),'hooks'=>$e['hook_profile']??array(),
+                'sql'=>$e['sql']??array(),'http'=>$e['http']??array(),'groups'=>$e['included_groups']??array(),'resources'=>$e['resources']??array(),'wp'=>$e['wordpress']??array(),'coverage'=>$e['deep_coverage']??array(),
             );
         }
-        usort($rows,function($a,$b){if($a['state']!==$b['state'])return $a['state']==='ACTIVE'?-1:1;if($a['state']==='ACTIVE')return strcmp($b['timestamp'],$a['timestamp']);return ((float)($b['cpu']??0))<=>((float)($a['cpu']??0));});
+        usort($rows,function($a,$b){if($a['state']!==$b['state'])return $a['state']==='ACTIVE'?-1:1;if($a['state']==='ACTIVE')return strcmp($b['timestamp'],$a['timestamp']);return ((float)($b['wall']??0))<=>((float)($a['wall']??0));});
         return $rows;
     }
 
@@ -300,6 +333,8 @@ final class Rocket_Request_Tracer {
         update_option(self::OPT_ENABLED,($healthy&&!empty($_POST['enabled']))?1:0,false);
         update_option(self::OPT_DEEP,!empty($_POST['deep'])?1:0,false);
         update_option(self::OPT_MAX_MB,max(1,min(250,(int)($_POST['max_mb']??25))),false);
+        update_option(self::OPT_SLOW_MS,max(250,min(60000,(int)($_POST['slow_ms']??1500))),false);
+        update_option(self::OPT_CALLBACK_FLOOR,max(0.1,min(1000,(float)($_POST['callback_floor']??5))),false);
         $this->redirect_admin();
     }
     public function handle_repair_mu(){ $this->require_admin_action(); self::install_mu_bridge(); $this->redirect_admin(); }
@@ -319,12 +354,12 @@ final class Rocket_Request_Tracer {
     }
 
     private function render_detail($row){
-        echo '<details><summary style="cursor:pointer">Inspect</summary><div style="min-width:700px">';
+        echo '<details><summary style="cursor:pointer">Inspect</summary><div style="min-width:760px">';
         if($row['state']==='ACTIVE'){
             $pid=(int)$row['pid'];echo '<p><strong>Live PID</strong></p>';
             foreach(array("ps -p $pid -o pid,ppid,user,stat,etime,time,%cpu,%mem,rss,wchan:32,cmd","timeout 5 strace -f -ttT -s 256 -p $pid","sudo phpspy --pid=$pid --limit=200","lsof -nP -p $pid") as $cmd)echo '<p><code>'.esc_html($cmd).'</code></p>';
         } else {
-            foreach(array('Lifecycle phases'=>$row['phases'],'WordPress context'=>$row['wp'],'Resource deltas'=>$row['resources'],'Included code'=>$row['groups'],'SQL'=>$row['sql'],'Outbound HTTP'=>$row['http']) as $title=>$data){echo '<p><strong>'.esc_html($title).'</strong></p><pre style="white-space:pre-wrap">'.esc_html(wp_json_encode($data,JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES)).'</pre>';}
+            foreach(array('Hook / callback profile'=>$row['hooks'],'Lifecycle phases'=>$row['phases'],'Deep coverage'=>$row['coverage'],'WordPress context'=>$row['wp'],'Resource deltas'=>$row['resources'],'Included code'=>$row['groups'],'SQL'=>$row['sql'],'Outbound HTTP'=>$row['http']) as $title=>$data){echo '<p><strong>'.esc_html($title).'</strong></p><pre style="white-space:pre-wrap">'.esc_html(wp_json_encode($data,JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES)).'</pre>';}
         }
         echo '</div></details>';
     }
@@ -332,30 +367,33 @@ final class Rocket_Request_Tracer {
     public function render_admin(){
         if(!current_user_can('manage_options'))return;
         $healthy=$this->mu_healthy();$rows=$this->build_rows($this->read_events());$enabled=(bool)get_option(self::OPT_ENABLED,false);$deep=(bool)get_option(self::OPT_DEEP,false);$max_mb=(int)get_option(self::OPT_MAX_MB,25);
+        $slow_ms=(int)get_option(self::OPT_SLOW_MS,1500);$callback_floor=(float)get_option(self::OPT_CALLBACK_FLOOR,5);
         ?>
         <div class="wrap">
             <h1>Request Monitor <small style="font-size:14px;color:#646970">v<?php echo esc_html(self::VERSION); ?></small></h1>
-            <p>Mandatory MU bootstrap tracing: request → PID → WordPress lifecycle → CPU/I/O → SQL/HTTP attribution.</p>
-            <div style="background:#fff;border:1px solid #ccd0d4;padding:14px 16px;margin:16px 0"><strong>MU bootstrap:</strong>
+            <p>Mandatory MU tracing with automatic slow-request escalation and plugin/theme hook callback attribution.</p>
+            <div style="background:#fff;border:1px solid #ccd0d4;padding:14px 16px;margin:16px 0"><strong>MU foundation:</strong>
                 <?php if($healthy):?><span style="color:#008a20;font-weight:700">HEALTHY</span><?php else:?><span style="color:#b32d2e;font-weight:700">MISSING / OUTDATED</span><?php endif;?>
-                &nbsp;<code><?php echo esc_html(self::mu_target_path()); ?></code>
-                <?php if(!$healthy):?><a class="button" href="<?php echo esc_url(wp_nonce_url(admin_url('admin-post.php?action=rrt_repair_mu'),self::NONCE)); ?>">Repair MU bridge</a><?php endif;?>
+                &nbsp; bootstrap + hook profiler
+                <?php if(!$healthy):?><a class="button" href="<?php echo esc_url(wp_nonce_url(admin_url('admin-post.php?action=rrt_repair_mu'),self::NONCE)); ?>">Repair MU foundation</a><?php endif;?>
             </div>
             <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="background:#fff;border:1px solid #ccd0d4;padding:14px 16px;margin:16px 0">
                 <?php wp_nonce_field(self::NONCE); ?><input type="hidden" name="action" value="rrt_save">
                 <label style="margin-right:20px"><input type="checkbox" name="enabled" value="1" <?php checked($enabled); ?> <?php disabled(!$healthy); ?>> <strong>Enable tracing</strong></label>
-                <label style="margin-right:20px"><input type="checkbox" name="deep" value="1" <?php checked($deep); ?>> <strong>Deep attribution</strong></label>
-                <label>Max log MB <input type="number" name="max_mb" min="1" max="250" value="<?php echo esc_attr($max_mb); ?>" style="width:75px"></label>
+                <label style="margin-right:20px"><input type="checkbox" name="deep" value="1" <?php checked($deep); ?>> <strong>Deep from request start</strong></label><br><br>
+                <label style="margin-right:20px">Slow threshold <input type="number" name="slow_ms" min="250" max="60000" value="<?php echo esc_attr($slow_ms); ?>" style="width:90px"> ms</label>
+                <label style="margin-right:20px">Callback detail floor <input type="number" step="0.1" name="callback_floor" min="0.1" max="1000" value="<?php echo esc_attr($callback_floor); ?>" style="width:80px"> ms</label>
+                <label>Max log <input type="number" name="max_mb" min="1" max="250" value="<?php echo esc_attr($max_mb); ?>" style="width:75px"> MB</label>
                 <?php submit_button('Save settings','primary','submit',false); ?>
-                <p style="margin-bottom:0;color:#646970">Deep mode enables SQL query retention from MU-plugin load onward plus WordPress HTTP caller timing. Use it for short production windows.</p>
+                <p style="margin-bottom:0;color:#646970">Basic mode times whole hooks continuously. Exact eligible plugin/theme callback timing arms automatically after the slow threshold. Deep mode starts callback + SQL timing immediately. Callbacks with by-reference parameters are intentionally not wrapped.</p>
             </form>
             <p><a class="button" href="<?php echo esc_url(admin_url('tools.php?page=rocket-request-tracer')); ?>">Refresh</a>
                 <a class="button" href="<?php echo esc_url(wp_nonce_url(admin_url('admin-post.php?action=rrt_download'),self::NONCE)); ?>">Download JSONL</a>
                 <a class="button" href="<?php echo esc_url(wp_nonce_url(admin_url('admin-post.php?action=rrt_clear'),self::NONCE)); ?>" onclick="return confirm('Clear trace log?')">Clear Log</a></p>
-            <div style="overflow:auto;background:#fff;border:1px solid #ccd0d4"><table class="widefat striped" style="min-width:1800px">
-                <thead><tr><th>Class</th><th>UTC</th><th>PID</th><th>Method</th><th>Path</th><th>Action</th><th>Safe query</th><th>Wall</th><th>CPU</th><th>CPU %</th><th>Peak MB</th><th>Files</th><th>IP</th><th>CF-Ray</th><th>Details</th></tr></thead><tbody>
+            <div style="overflow:auto;background:#fff;border:1px solid #ccd0d4"><table class="widefat striped" style="min-width:1950px">
+                <thead><tr><th>Class</th><th>Capture</th><th>UTC</th><th>PID</th><th>Method</th><th>Path</th><th>Action</th><th>Safe query</th><th>Wall</th><th>CPU</th><th>CPU %</th><th>Peak MB</th><th>Files</th><th>IP</th><th>CF-Ray</th><th>Details</th></tr></thead><tbody>
                 <?php foreach(array_slice($rows,0,300) as $row):?><tr>
-                    <td><?php echo $this->badge($row['class']); ?></td><td><small><?php echo esc_html($row['timestamp']); ?></small></td><td><code><?php echo esc_html($row['pid']); ?></code></td>
+                    <td><?php echo $this->badge($row['class']); ?></td><td><code><?php echo esc_html($row['capture']); ?></code><?php echo $row['slow']?' <strong>SLOW</strong>':''; ?></td><td><small><?php echo esc_html($row['timestamp']); ?></small></td><td><code><?php echo esc_html($row['pid']); ?></code></td>
                     <td><?php echo esc_html($row['method']); ?></td><td><code><?php echo esc_html($row['path']); ?></code></td><td><code><?php echo esc_html($row['action']); ?></code></td>
                     <td><code><?php echo esc_html(wp_json_encode($row['query'],JSON_UNESCAPED_SLASHES)); ?></code></td>
                     <td><?php echo $row['wall']!==null?esc_html(number_format_i18n($row['wall'],1).' ms'):'—'; ?></td><td><?php echo $row['cpu']!==null?esc_html(number_format_i18n($row['cpu'],1).' ms'):'—'; ?></td>
