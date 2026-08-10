@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Request Monitor Bootstrap
  * Description: Mandatory MU bootstrap for Request Monitor.
- * Version: 0.3.0
+ * Version: 0.4.0
  */
 
 if (!defined('ABSPATH') || defined('RRT_MU_BOOTSTRAP_LOADED')) {
@@ -10,7 +10,12 @@ if (!defined('ABSPATH') || defined('RRT_MU_BOOTSTRAP_LOADED')) {
 }
 
 define('RRT_MU_BOOTSTRAP_LOADED', true);
-define('RRT_MU_VERSION', '0.3.0');
+define('RRT_MU_VERSION', '0.4.0');
+
+$rrt_profiler_file = __DIR__ . '/request-monitor-hook-profiler.php';
+if (is_file($rrt_profiler_file)) {
+    require_once $rrt_profiler_file;
+}
 
 function rrt_mu_server($key, $limit = 1000) {
     if (!isset($_SERVER[$key]) || !is_scalar($_SERVER[$key])) return null;
@@ -152,6 +157,7 @@ function rrt_mu_shutdown() {
     $resources=rrt_mu_delta($ctx['resource_start'],rrt_mu_snapshot());
     $wall_ms=($end-$ctx['start_time'])*1000; $cpu_ms=$resources['cpu_total_ms']??null;
     $ratio=($cpu_ms!==null&&$wall_ms>0)?min(10,$cpu_ms/$wall_ms):null;
+    $is_slow = $wall_ms >= $ctx['slow_threshold_ms'];
     $last=error_get_last(); $fatal=null;
     if ($last&&in_array($last['type'],array(E_ERROR,E_PARSE,E_CORE_ERROR,E_COMPILE_ERROR,E_USER_ERROR,E_RECOVERABLE_ERROR),true)) $fatal=array('type'=>$last['type'],'message'=>$last['message'],'file'=>$last['file'],'line'=>$last['line']);
     $extra=array();
@@ -159,13 +165,24 @@ function rrt_mu_shutdown() {
         try { $candidate=call_user_func($ctx['finalizer']); if(is_array($candidate))$extra=$candidate; }
         catch(Throwable $e){$extra['finalizer_error']=$e->getMessage();}
     }
+
+    $hook_profile = array('available'=>false,'reason'=>'hook profiler helper not loaded');
+    if (class_exists('Request_Monitor_Hook_Profiler', false)) {
+        $hook_profile = Request_Monitor_Hook_Profiler::report($is_slow || !empty($ctx['deep']));
+        $hook_profile['available'] = true;
+    }
+
+    $capture_level = !empty($ctx['deep']) ? ($is_slow ? 'deep_slow' : 'deep') : ($is_slow ? 'auto_slow' : 'basic');
+
     $event=array_merge(array(
-        'event'=>'END','version'=>'0.3.0','mu_version'=>RRT_MU_VERSION,'capture_stage'=>'mu-bootstrap','timestamp'=>rrt_mu_timestamp($end),
+        'event'=>'END','version'=>'0.4.0','mu_version'=>RRT_MU_VERSION,'capture_stage'=>'mu-bootstrap','timestamp'=>rrt_mu_timestamp($end),
         'request_id'=>$ctx['request_id'],'pid'=>$ctx['pid'],'method'=>$ctx['method'],'host'=>$ctx['host'],'path'=>$ctx['path'],'status'=>function_exists('http_response_code')?http_response_code():null,
         'wall_ms'=>round($wall_ms,3),'cpu_user_ms'=>$resources['cpu_user_ms']??null,'cpu_sys_ms'=>$resources['cpu_sys_ms']??null,'cpu_total_ms'=>$cpu_ms,'cpu_ratio'=>$ratio!==null?round($ratio,4):null,
-        'classification'=>rrt_mu_classify($wall_ms,$ratio),'peak_memory_mb'=>round(memory_get_peak_usage(true)/1048576,2),'memory_end_mb'=>round(memory_get_usage(true)/1048576,2),
+        'classification'=>rrt_mu_classify($wall_ms,$ratio),'slow_request'=>$is_slow,'slow_threshold_ms'=>$ctx['slow_threshold_ms'],'slow_over_ms'=>$is_slow?round($wall_ms-$ctx['slow_threshold_ms'],3):0,
+        'capture_level'=>$capture_level,'auto_escalated'=>!empty($ctx['auto_escalated']),'auto_escalated_at_ms'=>$ctx['auto_escalated_at_ms']??null,'auto_escalation_reason'=>$ctx['auto_escalation_reason']??null,
+        'peak_memory_mb'=>round(memory_get_peak_usage(true)/1048576,2),'memory_end_mb'=>round(memory_get_usage(true)/1048576,2),
         'resources'=>$resources,'phases'=>$ctx['phases'],'phase_durations'=>rrt_mu_phase_durations($ctx['phases'],$end),'included_files'=>count(get_included_files()),
-        'connection_aborted'=>function_exists('connection_aborted')?connection_aborted():null,'fatal'=>$fatal,
+        'hook_profile'=>$hook_profile,'connection_aborted'=>function_exists('connection_aborted')?connection_aborted():null,'fatal'=>$fatal,
     ),$extra);
     rrt_mu_write($event);
 }
@@ -179,14 +196,31 @@ $query_string=isset($_SERVER['QUERY_STRING'])?(string)$_SERVER['QUERY_STRING']:'
 $wp_action=isset($_REQUEST['action'])&&is_scalar($_REQUEST['action'])?substr((string)$_REQUEST['action'],0,200):null;
 $wc_ajax=isset($_GET['wc-ajax'])&&is_scalar($_GET['wc-ajax'])?substr((string)$_GET['wc-ajax'],0,200):null;
 $deep=(bool)get_option('rrt_deep_attribution',false);
-$GLOBALS['rrt_bootstrap_context']=array('start_time'=>$start,'request_id'=>$request_id,'pid'=>$pid,'method'=>$_SERVER['REQUEST_METHOD']??null,'host'=>$_SERVER['HTTP_HOST']??null,'path'=>$path,'deep'=>$deep,'resource_start'=>rrt_mu_snapshot(),'phases'=>array('mu_loaded'=>$start),'finalizer'=>null);
-if ($deep) { global $wpdb; if(isset($wpdb)&&is_object($wpdb)&&property_exists($wpdb,'save_queries'))$wpdb->save_queries=true; }
+$slow_threshold_ms=max(250,min(60000,(int)get_option('rrt_slow_threshold_ms',1500)));
+$callback_floor_ms=max(0.1,min(1000,(float)get_option('rrt_callback_floor_ms',5)));
+
+$GLOBALS['rrt_bootstrap_context']=array(
+    'start_time'=>$start,'request_id'=>$request_id,'pid'=>$pid,'method'=>$_SERVER['REQUEST_METHOD']??null,'host'=>$_SERVER['HTTP_HOST']??null,'path'=>$path,
+    'deep'=>$deep,'slow_threshold_ms'=>$slow_threshold_ms,'callback_floor_ms'=>$callback_floor_ms,'auto_escalated'=>false,'auto_escalated_at_ms'=>null,'auto_escalation_reason'=>null,
+    'resource_start'=>rrt_mu_snapshot(),'phases'=>array('mu_loaded'=>$start),'finalizer'=>null,
+);
+
+if ($deep) {
+    global $wpdb;
+    if(isset($wpdb)&&is_object($wpdb)&&property_exists($wpdb,'save_queries'))$wpdb->save_queries=true;
+}
+
+if (class_exists('Request_Monitor_Hook_Profiler', false)) {
+    Request_Monitor_Hook_Profiler::start($start,$slow_threshold_ms,$callback_floor_ms,$deep);
+}
+
 rrt_mu_write(array(
-    'event'=>'START','version'=>'0.3.0','mu_version'=>RRT_MU_VERSION,'capture_stage'=>'mu-bootstrap','timestamp'=>rrt_mu_timestamp($start),'request_id'=>$request_id,'pid'=>$pid,
+    'event'=>'START','version'=>'0.4.0','mu_version'=>RRT_MU_VERSION,'capture_stage'=>'mu-bootstrap','timestamp'=>rrt_mu_timestamp($start),'request_id'=>$request_id,'pid'=>$pid,
     'ppid'=>function_exists('posix_getppid')?@posix_getppid():null,'uid'=>function_exists('posix_geteuid')?@posix_geteuid():null,'method'=>$_SERVER['REQUEST_METHOD']??null,'host'=>$_SERVER['HTTP_HOST']??null,'path'=>$path,
     'query_keys'=>array_keys($_GET),'query_hash'=>$query_string!==''?substr(hash('sha256',$query_string),0,16):null,'safe_query'=>rrt_mu_safe_query(),'wp_action'=>$wp_action,'wc_ajax'=>$wc_ajax,
     'script'=>$_SERVER['SCRIPT_FILENAME']??null,'cf_ray'=>rrt_mu_server('HTTP_CF_RAY',200),'client_ip'=>rrt_mu_server('HTTP_CF_CONNECTING_IP',100)?:rrt_mu_server('REMOTE_ADDR',100),
     'remote_ip'=>rrt_mu_server('REMOTE_ADDR',100),'user_agent'=>rrt_mu_server('HTTP_USER_AGENT',1000),'referer'=>rrt_mu_server('HTTP_REFERER',1000),'content_type'=>rrt_mu_server('CONTENT_TYPE',200),
-    'content_length'=>isset($_SERVER['CONTENT_LENGTH'])?(int)$_SERVER['CONTENT_LENGTH']:null,'deep'=>$deep,'is_cron'=>defined('DOING_CRON')&&DOING_CRON,'is_ajax'=>defined('DOING_AJAX')&&DOING_AJAX,
+    'content_length'=>isset($_SERVER['CONTENT_LENGTH'])?(int)$_SERVER['CONTENT_LENGTH']:null,'deep'=>$deep,'slow_threshold_ms'=>$slow_threshold_ms,'callback_floor_ms'=>$callback_floor_ms,
+    'hook_profiler_available'=>class_exists('Request_Monitor_Hook_Profiler',false),'is_cron'=>defined('DOING_CRON')&&DOING_CRON,'is_ajax'=>defined('DOING_AJAX')&&DOING_AJAX,
 ));
 register_shutdown_function('rrt_mu_shutdown');
