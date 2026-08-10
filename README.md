@@ -1,8 +1,8 @@
 # Request Monitor
 
-Request Monitor is a temporary production diagnostics plugin for WordPress that correlates an incoming HTTP request with the **exact PHP/LSAPI PID handling it**, then records enough runtime evidence to determine whether that request is consuming CPU, waiting on dependencies, or doing a mixture of both.
+Request Monitor is a temporary production diagnostics plugin for WordPress that correlates an incoming HTTP request with the **exact PHP/LSAPI PID handling it**, then traces enough of the request lifecycle to explain why PHP workers remain occupied.
 
-The project is designed around a common hosting incident:
+It is designed for incidents that start like this:
 
 ```text
 LSAPI queue fills
@@ -19,213 +19,204 @@ request / CF-Ray / client
         ↓
 exact PHP PID
         ↓
-MU bootstrap START
+mandatory MU bootstrap START
         ↓
-WordPress lifecycle phases
+WordPress lifecycle + hook timing
+        ↓
+slow-request automatic escalation
+        ↓
+plugin/theme callback timing
         ↓
 CPU / wall / memory / I/O
         ↓
 SQL + outbound HTTP attribution
-        ↓
-plugin/theme code ownership
         ↓
 optional live PID inspection
 ```
 
 ## Current version
 
-**v0.3.0**
+**v0.4.0**
+
+Request Monitor is an incident-analysis tool, not a permanent APM replacement. Keep tracing disabled when it is not needed.
 
 ## Mandatory MU foundation
 
-The MU bootstrap is no longer optional.
-
-The normal plugin bundles:
+The normal plugin automatically installs two required files into `wp-content/mu-plugins`:
 
 ```text
-mu/request-monitor-bootstrap.php
+request-monitor-bootstrap.php
+request-monitor-hook-profiler.php
 ```
 
-On activation, Request Monitor installs it as:
+The regular plugin will not enable tracing unless both deployed files match the bundled versions.
 
-```text
-wp-content/mu-plugins/request-monitor-bootstrap.php
-```
+The MU layer owns the authoritative request START and END records so tracing begins before normal plugins load and survives through PHP shutdown.
 
-If that installation cannot be completed, plugin activation fails instead of silently falling back to lower-quality tracing.
+## What is captured
 
-The normal plugin also verifies the MU bridge from WordPress admin and repairs an outdated copy automatically. The dashboard reports the bridge as `HEALTHY` or `MISSING / OUTDATED` and provides a manual repair control.
-
-### Why the MU layer matters
-
-A normal WordPress plugin starts too late to be the authoritative beginning of a request. The MU bootstrap loads before ordinary plugins, so it can create the request context earlier and preserve the same PID/request ID until PHP shutdown.
-
-The architecture is now:
-
-```text
-MU bootstrap
-    ├─ request ID / PID
-    ├─ edge/request metadata
-    ├─ initial CPU + /proc snapshot
-    ├─ optional early SQL collection
-    └─ START log record
-          ↓
-regular Request Monitor plugin
-    ├─ WordPress lifecycle marks
-    ├─ SQL attribution
-    ├─ WordPress HTTP attribution
-    ├─ query/request context
-    └─ plugin/theme ownership
-          ↓
-MU shutdown finalizer
-    ├─ END resource snapshot
-    ├─ CPU/wall classification
-    ├─ lifecycle durations
-    └─ enriched END record
-```
-
-The MU layer owns both START and END. The regular plugin enriches that shared context.
-
-## Captured request identity
-
-Each traced request records:
+### Request identity
 
 - request ID
 - PHP PID / PPID / UID
 - UTC timestamp
 - method / host / path
-- safe diagnostic query parameters
+- safe selected query parameters
 - WordPress AJAX action
-- WooCommerce `wc-ajax` action
+- WooCommerce `wc-ajax`
 - Cloudflare Ray ID
 - Cloudflare connecting IP
 - remote IP
 - User-Agent / Referer
-- content type / content length
-- cron and AJAX markers
+- request content type / length
 
-This provides a direct correlation such as:
-
-```text
-CF-Ray a28a04dadf32240a-EWR
-GET /furniture/home-decor/
-PID 2777019
-```
-
-## Runtime classification
-
-Completed requests record:
+### Runtime behavior
 
 - wall time
-- user CPU
-- system CPU
-- total CPU
-- CPU/wall ratio
-- peak PHP memory
-- ending PHP memory
+- PHP user/system/total CPU
+- CPU-to-wall ratio
+- CPU / WAIT / MIXED / FAST classification
+- peak/end PHP memory
+- page faults
+- voluntary/involuntary context switches
+- block I/O counters
+- `/proc/self/io` counters when available
+- included PHP files and code ownership
 
-Classification is intentionally simple:
+### WordPress lifecycle
 
-| Class | Interpretation |
-|---|---|
-| `FAST` | wall time below 750 ms |
-| `CPU_BOUND` | CPU is at least ~70% of wall time |
-| `WAIT_BOUND` | CPU is at most ~25% of wall time |
-| `MIXED` | meaningful CPU and waiting |
-| `ACTIVE` | START exists without END yet |
+The MU/regular-plugin handoff records phase timing around points such as:
 
-Example:
-
-```text
-Wall: 29,009 ms
-CPU:  28,947 ms
-CPU ratio: 99.8%
-→ CPU_BOUND
-```
-
-That request effectively occupied one core for almost its entire lifetime.
-
-## WordPress lifecycle timing
-
-v0.3.0 records phase marks where applicable, including:
-
-- MU bootstrap load
+- MU bootstrap
 - regular plugin load
 - `plugins_loaded`
 - `after_setup_theme`
 - `init`
 - `wp_loaded`
-- `parse_request`
+- request parsing
 - `wp`
-- `rest_api_init`
-- `admin_init`
+- REST/admin initialization
 - `template_redirect`
 - shutdown
 
-The END record contains durations between observed phases, which helps locate *where* the time accumulated before a function-level profiler is required.
+## Automatic slow-request escalation
 
-## Linux process resource deltas
+The default threshold is **1500 ms** and is configurable under **Tools → Request Monitor**.
 
-Where available, Request Monitor captures `getrusage()` and `/proc/self/io` deltas:
+Basic tracing deliberately does not enable every expensive collector from request start. Instead:
 
-- minor / major page faults
-- voluntary / involuntary context switches
-- block I/O counters
-- logical characters read/written
-- physical bytes read/written
-- read/write syscall counts
+1. request/PID/resource tracing starts immediately
+2. whole WordPress hooks are timed from request start
+3. outbound WordPress HTTP calls are timed from request start
+4. once elapsed request time crosses the slow threshold, exact eligible plugin/theme callback timing is armed
+5. SQL `SAVEQUERIES` is enabled from the escalation point forward
+6. slow requests persist the rich hook/callback report
 
-## Deep attribution
+The final record exposes:
 
-Deep attribution is explicitly opt-in because it adds overhead.
+```text
+slow_request
+slow_threshold_ms
+slow_over_ms
+capture_level
+auto_escalated
+auto_escalated_at_ms
+auto_escalation_reason
+```
 
-When enabled, the MU bootstrap turns on `$wpdb->save_queries` as early as the MU-plugin stage, improving coverage compared with enabling it from a normal plugin.
+This keeps basic tracing bounded while automatically enriching requests that become operationally interesting.
 
-The final trace includes:
+## Deep mode
 
-### SQL
+Deep mode starts rich attribution from the beginning of the request:
+
+- exact eligible plugin/theme callback timing
+- SQL query retention
+- outbound WordPress HTTP timing
+
+Deep mode provides better coverage but has higher request-memory/CPU overhead and should be used for deliberate diagnostic windows.
+
+## Hook timing
+
+Every traced request receives lightweight whole-hook timing.
+
+For slow/deep requests, the report includes the most expensive hooks with:
+
+- invocation count
+- total inclusive duration
+- maximum duration
+- bounded callback manifest
+
+This is particularly useful on the first slow request: even when a single callback crosses the threshold before exact callback timing is armed, the enclosing WordPress hook can still be identified.
+
+## Per-plugin/function callback timing
+
+When callback timing is armed, Request Monitor times eligible application callbacks registered on WordPress hooks.
+
+Each retained callback contains:
+
+- hook
+- priority
+- callable / class method
+- owning plugin, MU plugin, or theme
+- source file
+- invocation count
+- inclusive total time
+- maximum invocation time
+
+The report also aggregates callback time by owner, making results such as this possible:
+
+```text
+plugin:woocommerce-product-filter
+    4 callbacks
+    3,812 ms inclusive
+
+Vendor_Filter::build_facets
+    hook: pre_get_posts
+    2,947 ms
+```
+
+### Safety rules
+
+Exact callback timing intentionally avoids callbacks that declare by-reference parameters. A generic timing proxy can alter PHP reference semantics, so those callbacks are left untouched and reported as skipped.
+
+WordPress core callbacks are not wrapped. Whole-hook timing still includes their contribution; exact callback timing focuses on plugin, MU-plugin, and theme application code.
+
+The callback timing store is bounded and ignores individual callback samples below the configurable detail floor (default **5 ms**).
+
+See [`docs/slow-hook-profiling.md`](docs/slow-hook-profiling.md) for the coverage and safety model.
+
+## SQL attribution
+
+When SQL collection is active, Request Monitor records:
 
 - query count
-- total SQL duration
-- top 10 slowest queries
+- total query time
+- top slow queries
 - normalized/redacted SQL shape
 - query hash
 - WordPress caller information
+- explicit coverage (`from_start` or `post_threshold`)
 
-### WordPress outbound HTTP
+SQL values are normalized before being persisted.
 
-- destination URL without query string
+## Outbound HTTP attribution
+
+WordPress HTTP API calls are timed from normal-plugin load for every traced request and can include:
+
+- URL without query string
 - duration
-- response/error
-- WordPress caller/backtrace summary
-- transport class
+- status / error
+- caller summary
+- transport
 
-## WordPress context
-
-At shutdown the regular plugin contributes:
-
-- admin / AJAX / cron / REST state
-- PHP version
-- WordPress version
-- PHP memory limit
-- main-query characteristics
-- post count / found posts when available
-
-## Included-code ownership
-
-Loaded PHP files are grouped by:
-
-- WordPress core
-- plugins
-- MU plugins
-- themes
-- other code
-
-This is contextual evidence, **not execution-time attribution**.
+Slow/deep requests retain the detailed call list.
 
 ## Active PID escalation
 
-An ACTIVE request exposes the exact live PID. The UI provides ready-to-run commands:
+A START record without a matching END record is displayed as `ACTIVE`.
+
+The dashboard produces commands for the exact PID:
 
 ```bash
 ps -p PID -o pid,ppid,user,stat,etime,time,%cpu,%mem,rss,wchan:32,cmd
@@ -243,76 +234,110 @@ sudo phpspy --pid=PID --limit=200
 lsof -nP -p PID
 ```
 
-The intended final chain is:
+This gives the escalation path:
 
 ```text
-URL → CF-Ray → PID → runtime classification → WordPress evidence → live PHP stack
+HTTP request
+    ↓
+PID
+    ↓
+Request Monitor evidence
+    ↓
+exact WordPress hook/plugin callback evidence
+    ↓
+phpspy / strace only when needed
 ```
 
 ## Installation
 
-1. Install the repository as a normal WordPress plugin.
-2. Activate **Request Monitor**.
-3. Activation installs the mandatory MU bridge automatically.
-4. Open **Tools → Request Monitor**.
-5. Confirm `MU bootstrap: HEALTHY`.
-6. Enable tracing.
-7. Enable Deep attribution only for short investigation windows when needed.
+1. Install and activate the plugin normally.
+2. Activation installs/updates the mandatory MU components.
+3. Open **Tools → Request Monitor**.
+4. Confirm **MU foundation: HEALTHY**.
+5. Enable tracing.
 
-The WordPress/PHP user must be able to create/write `wp-content/mu-plugins` during activation or repair.
+If `wp-content/mu-plugins` cannot be written, activation fails closed instead of silently running with reduced capture.
+
+## Recommended settings
+
+For a first production incident capture:
+
+```text
+Tracing:               ON
+Deep from request start: OFF
+Slow threshold:        1500 ms
+Callback detail floor: 5 ms
+Max log:               25 MB
+```
+
+If the automatic capture identifies an expensive hook but callback coverage started too late, repeat the request briefly with **Deep from request start** enabled.
+
+## Reading a slow request
+
+A useful order is:
+
+1. `classification`
+2. wall / CPU ratio
+3. `hook_profile.top_hooks`
+4. `hook_profile.top_owners`
+5. `hook_profile.top_callbacks`
+6. lifecycle phases
+7. SQL attribution
+8. outbound HTTP
+9. process I/O/resource deltas
+10. live PID tooling if still needed
+
+Always check the coverage fields before concluding that missing callback/SQL detail means no work occurred there.
 
 ## Security and privacy
 
-Request Monitor does not intentionally log arbitrary POST bodies or complete query strings.
+The tracer avoids arbitrary POST-body capture and full query-string logging.
 
-The trace directory is:
+Runtime logs live under:
 
 ```text
 wp-content/rocket-request-tracer/
 ```
 
-The active log uses a randomized `.php` filename, starts with `exit; __halt_compiler();`, and the directory receives an `.htaccess` deny rule. JSONL download requires WordPress administrator capability plus nonce validation.
+The active trace file:
 
-SQL literals are normalized before persistence.
+- uses a randomized name
+- uses a `.php` extension
+- starts with `exit; __halt_compiler();`
+- receives an `.htaccess` deny rule
+- is downloadable only through a capability/nonce-protected admin action
 
-Treat trace output as sensitive diagnostic data and clear it after an investigation.
+Treat trace output as sensitive diagnostic data and clear it after the investigation.
 
-## Performance considerations
+## Important limitations
 
-Basic tracing uses lightweight request/process measurements.
+- This is application instrumentation, not a kernel profiler.
+- Automatic callback timing cannot retroactively recover callbacks that completed before the threshold was crossed.
+- Whole-hook timing is inclusive and can include nested hook work.
+- Exact callback rows are also inclusive and can double-count nested work when aggregating across call layers.
+- Direct database/network calls that bypass WordPress APIs may require host-level tracing.
+- `phpspy`/`strace` still require server-level permissions.
 
-Deep attribution retains WordPress SQL query metadata in PHP memory and should be enabled only for short diagnostic windows on production sites.
+## Documentation
 
-## Remaining blind spots
+- [`docs/architecture.md`](docs/architecture.md)
+- [`docs/slow-hook-profiling.md`](docs/slow-hook-profiling.md)
+- [`SECURITY.md`](SECURITY.md)
+- [`CHANGELOG.md`](CHANGELOG.md)
 
-The MU layer materially improves coverage, but it still does not execute before WordPress begins loading core bootstrap files. If pre-WordPress PHP bootstrap visibility is ever required, an `auto_prepend_file` layer would be earlier still.
+## Roadmap
 
-The plugin also cannot safely inspect another worker's executing PHP stack by itself; `phpspy`, `strace`, and similar privileged tools remain the escalation layer.
+Remaining likely directions include:
 
-## Repository layout
-
-```text
-.
-├── rocket-request-tracer.php
-├── mu/
-│   └── request-monitor-bootstrap.php
-├── README.md
-├── CHANGELOG.md
-├── SECURITY.md
-└── docs/
-    └── architecture.md
-```
-
-## Next roadmap items
-
-With the MU foundation in place, the next pieces can be tackled independently:
-
-- slow-request thresholding and sampling controls
-- per-hook / per-callback timing
-- request fingerprint grouping
-- query-hash correlation
-- MySQL process correlation
+- repeated request/query fingerprint grouping
+- incident-report generation
 - CLI companion for active PIDs
-- tighter `phpspy` integration when available on the host
-- incident report/export views
-- dedicated WP-CLI tracing controls
+- optional host-side `phpspy` integration
+- MySQL connection/process correlation
+- configurable trace scopes
+- WP-CLI/cron-specific analysis modes
+- before/after mitigation comparison
+
+## Development status
+
+Request Monitor is experimental production diagnostics software. Validate releases on staging or a controlled site before broad deployment.
