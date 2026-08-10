@@ -1,343 +1,241 @@
 # Request Monitor
 
-Request Monitor is a temporary production diagnostics plugin for WordPress that correlates an incoming HTTP request with the **exact PHP/LSAPI PID handling it**, then traces enough of the request lifecycle to explain why PHP workers remain occupied.
+Request Monitor is an incident-focused WordPress diagnostics plugin for tracing the exact PHP/LSAPI work behind slow requests and worker-pool saturation.
 
-It is designed for incidents that start like this:
-
-```text
-LSAPI queue fills
-    ↓
-dozens of lsphp workers appear
-    ↓
-traffic exists, but the actual server-side work is unclear
-```
-
-Request Monitor turns that into:
+It correlates:
 
 ```text
 request / CF-Ray / client
         ↓
 exact PHP PID
         ↓
-mandatory MU bootstrap START
-        ↓
-WordPress lifecycle + hook timing
-        ↓
-slow-request automatic escalation
-        ↓
-plugin/theme callback timing
+mandatory MU bootstrap
         ↓
 CPU / wall / memory / I/O
         ↓
+WordPress lifecycle + hook/callback timing
+        ↓
 SQL + outbound HTTP attribution
         ↓
-optional live PID inspection
+request/query fingerprints
+        ↓
+repeated expensive request families
 ```
 
-## Current version
+**Current version: 0.5.0**
 
-**v0.4.0**
+## What v0.5 adds
 
-Request Monitor is an incident-analysis tool, not a permanent APM replacement. Keep tracing disabled when it is not needed.
+### Repeated request/query fingerprints
 
-## Mandatory MU foundation
+Every traced request receives four privacy-conscious fingerprints:
 
-The normal plugin automatically installs two required files into `wp-content/mu-plugins`:
+- **Request fingerprint** — method + concrete normalized path + AJAX/WC action + query-value fingerprint.
+- **Pattern fingerprint** — method + templated path + action + query-key shape.
+- **Query fingerprint** — sorted query keys plus recursively hashed values.
+- **Query-shape fingerprint** — sorted query keys only.
+
+Pattern normalization groups families such as:
 
 ```text
-request-monitor-bootstrap.php
-request-monitor-hook-profiler.php
+/shop/page/37/  → /shop/page/{n}
+/product/12345/ → /product/{n}
+/api/550e8400-e29b-41d4-a716-446655440000/ → /api/{uuid}
 ```
 
-The regular plugin will not enable tracing unless both deployed files match the bundled versions.
+Raw arbitrary query values are not persisted for fingerprinting. Values influence hashes, while only the existing safe-query allowlist is stored in readable form.
 
-The MU layer owns the authoritative request START and END records so tracing begins before normal plugins load and survives through PHP shutdown.
+The dashboard and WP-CLI can aggregate fingerprints by count, slow requests, CPU-bound requests, average/max wall time, and CPU time.
 
-## What is captured
+### Configurable trace scopes
 
-### Request identity
+Tracing can be limited before a trace context/log record is created.
 
-- request ID
-- PHP PID / PPID / UID
-- UTC timestamp
-- method / host / path
-- safe selected query parameters
-- WordPress AJAX action
-- WooCommerce `wc-ajax`
-- Cloudflare Ray ID
-- Cloudflare connecting IP
-- remote IP
-- User-Agent / Referer
-- request content type / length
+Supported dimensions:
 
-### Runtime behavior
+- request type: `front`, `admin`, `ajax`, `rest`, `cron`, `cli`
+- HTTP/CLI method
+- include path globs
+- exclude path globs
+- include AJAX/WooCommerce actions
+- exclude AJAX/WooCommerce actions
 
-- wall time
-- PHP user/system/total CPU
-- CPU-to-wall ratio
-- CPU / WAIT / MIXED / FAST classification
-- peak/end PHP memory
-- page faults
-- voluntary/involuntary context switches
-- block I/O counters
-- `/proc/self/io` counters when available
-- included PHP files and code ownership
+Defaults include all web request types and exclude WP-CLI. Add `cli` explicitly when you want to profile WP-CLI workloads.
 
-### WordPress lifecycle
+Request Monitor's own WP-CLI management commands are always excluded from tracing.
 
-The MU/regular-plugin handoff records phase timing around points such as:
+### WP-CLI control
 
-- MU bootstrap
-- regular plugin load
-- `plugins_loaded`
-- `after_setup_theme`
-- `init`
-- `wp_loaded`
-- request parsing
-- `wp`
-- REST/admin initialization
-- `template_redirect`
-- shutdown
+The normal operational workflow no longer requires wp-admin:
 
-## Automatic slow-request escalation
+```bash
+wp request-monitor repair
+wp request-monitor enable --slow-ms=1500
+wp request-monitor scope set --types=front,ajax,rest --include-paths='/shop/*,/furniture/*'
+wp request-monitor status
+wp request-monitor active
+wp request-monitor fingerprints --mode=pattern --sort=cpu
+```
 
-The default threshold is **1500 ms** and is configurable under **Tools → Request Monitor**.
+Disable when finished:
 
-Basic tracing deliberately does not enable every expensive collector from request start. Instead:
+```bash
+wp request-monitor disable
+```
 
-1. request/PID/resource tracing starts immediately
-2. whole WordPress hooks are timed from request start
-3. outbound WordPress HTTP calls are timed from request start
-4. once elapsed request time crosses the slow threshold, exact eligible plugin/theme callback timing is armed
-5. SQL `SAVEQUERIES` is enabled from the escalation point forward
-6. slow requests persist the rich hook/callback report
+See [docs/cli.md](docs/cli.md).
 
-The final record exposes:
+## Existing tracing foundations
+
+### Mandatory MU foundation
+
+Activation installs and continuously verifies:
 
 ```text
-slow_request
-slow_threshold_ms
-slow_over_ms
-capture_level
-auto_escalated
-auto_escalated_at_ms
-auto_escalation_reason
+wp-content/mu-plugins/request-monitor-bootstrap.php
+wp-content/mu-plugins/request-monitor-runtime.php
+wp-content/mu-plugins/request-monitor-hook-profiler.php
 ```
 
-This keeps basic tracing bounded while automatically enriching requests that become operationally interesting.
+Tracing is unavailable if the bundled MU foundation is unhealthy.
 
-## Deep mode
+### Automatic slow-request escalation
 
-Deep mode starts rich attribution from the beginning of the request:
+Basic tracing remains bounded. A configurable slow threshold (default `1500 ms`) automatically escalates a request for richer diagnostics.
 
-- exact eligible plugin/theme callback timing
-- SQL query retention
-- outbound WordPress HTTP timing
+### Hook and callback timing
 
-Deep mode provides better coverage but has higher request-memory/CPU overhead and should be used for deliberate diagnostic windows.
+- whole-hook timing is collected from the beginning of traced requests
+- exact eligible plugin/theme callback timing starts after automatic escalation
+- Deep mode starts exact callback timing from request start
+- callbacks with by-reference parameters are deliberately not wrapped
 
-## Hook timing
+### CPU vs wait classification
 
-Every traced request receives lightweight whole-hook timing.
+Completed requests are classified as:
 
-For slow/deep requests, the report includes the most expensive hooks with:
+- `FAST`
+- `CPU_BOUND`
+- `WAIT_BOUND`
+- `MIXED`
 
-- invocation count
-- total inclusive duration
-- maximum duration
-- bounded callback manifest
+This is based on request wall time compared with actual PHP CPU time.
 
-This is particularly useful on the first slow request: even when a single callback crosses the threshold before exact callback timing is armed, the enclosing WordPress hook can still be identified.
+### Deep attribution
 
-## Per-plugin/function callback timing
+Deep mode can capture:
 
-When callback timing is armed, Request Monitor times eligible application callbacks registered on WordPress hooks.
+- `$wpdb` query timing and caller information
+- slow normalized SQL shapes
+- outbound WordPress HTTP calls, duration and caller
+- hook/callback owner attribution
+- WordPress main-query context
 
-Each retained callback contains:
+### Live PID escalation
 
-- hook
-- priority
-- callable / class method
-- owning plugin, MU plugin, or theme
-- source file
-- invocation count
-- inclusive total time
-- maximum invocation time
-
-The report also aggregates callback time by owner, making results such as this possible:
-
-```text
-plugin:woocommerce-product-filter
-    4 callbacks
-    3,812 ms inclusive
-
-Vendor_Filter::build_facets
-    hook: pre_get_posts
-    2,947 ms
-```
-
-### Safety rules
-
-Exact callback timing intentionally avoids callbacks that declare by-reference parameters. A generic timing proxy can alter PHP reference semantics, so those callbacks are left untouched and reported as skipped.
-
-WordPress core callbacks are not wrapped. Whole-hook timing still includes their contribution; exact callback timing focuses on plugin, MU-plugin, and theme application code.
-
-The callback timing store is bounded and ignores individual callback samples below the configurable detail floor (default **5 ms**).
-
-See [`docs/slow-hook-profiling.md`](docs/slow-hook-profiling.md) for the coverage and safety model.
-
-## SQL attribution
-
-When SQL collection is active, Request Monitor records:
-
-- query count
-- total query time
-- top slow queries
-- normalized/redacted SQL shape
-- query hash
-- WordPress caller information
-- explicit coverage (`from_start` or `post_threshold`)
-
-SQL values are normalized before being persisted.
-
-## Outbound HTTP attribution
-
-WordPress HTTP API calls are timed from normal-plugin load for every traced request and can include:
-
-- URL without query string
-- duration
-- status / error
-- caller summary
-- transport
-
-Slow/deep requests retain the detailed call list.
-
-## Active PID escalation
-
-A START record without a matching END record is displayed as `ACTIVE`.
-
-The dashboard produces commands for the exact PID:
+For an active request, use its exact PID with host tools:
 
 ```bash
 ps -p PID -o pid,ppid,user,stat,etime,time,%cpu,%mem,rss,wchan:32,cmd
-```
-
-```bash
 timeout 5 strace -f -ttT -s 256 -p PID
-```
-
-```bash
+lsof -nP -p PID
 sudo phpspy --pid=PID --limit=200
 ```
 
+## WP-CLI examples
+
+Trace only frontend catalog traffic:
+
 ```bash
-lsof -nP -p PID
+wp request-monitor scope set \
+  --types=front \
+  --methods=GET \
+  --include-paths='/shop/*,/furniture/*'
+wp request-monitor enable
 ```
 
-This gives the escalation path:
+Trace AJAX only:
+
+```bash
+wp request-monitor scope set --types=ajax
+wp request-monitor enable --deep
+```
+
+Trace selected AJAX actions:
+
+```bash
+wp request-monitor scope set \
+  --types=ajax \
+  --include-actions='some_action,wc_*'
+```
+
+Trace WP-CLI work itself:
+
+```bash
+wp request-monitor scope set --types=cli
+wp request-monitor enable
+wp cron event run --due-now
+wp request-monitor disable
+```
+
+`wp request-monitor ...` commands themselves are never traced.
+
+Find repeated expensive families:
+
+```bash
+wp request-monitor fingerprints --mode=pattern --sort=cpu --min-count=2
+```
+
+Find exact repeated request/query combinations:
+
+```bash
+wp request-monitor fingerprints --mode=request --sort=wall --slow-only
+```
+
+## Security / privacy
+
+Request Monitor is intended for short production diagnostic windows.
+
+- arbitrary POST bodies are not logged
+- arbitrary query values are not persisted by fingerprinting
+- SQL literals are normalized/redacted before storage
+- trace files use randomized `.php` filenames with an immediate `exit` / `__halt_compiler()` guard
+- an `.htaccess` deny is added as defense in depth
+- logs should still be treated as diagnostic/sensitive data
+
+## Repository layout
 
 ```text
-HTTP request
-    ↓
-PID
-    ↓
-Request Monitor evidence
-    ↓
-exact WordPress hook/plugin callback evidence
-    ↓
-phpspy / strace only when needed
+.
+├── rocket-request-tracer.php
+├── includes/
+│   ├── class-request-monitor-core.php
+│   ├── class-request-monitor-store.php
+│   ├── class-request-monitor-admin.php
+│   └── class-request-monitor-cli.php
+├── mu/
+│   ├── request-monitor-bootstrap.php
+│   ├── request-monitor-runtime.php
+│   └── request-monitor-hook-profiler.php
+└── docs/
+    ├── architecture.md
+    ├── cli.md
+    ├── fingerprints-scopes.md
+    └── slow-hook-profiling.md
 ```
-
-## Installation
-
-1. Install and activate the plugin normally.
-2. Activation installs/updates the mandatory MU components.
-3. Open **Tools → Request Monitor**.
-4. Confirm **MU foundation: HEALTHY**.
-5. Enable tracing.
-
-If `wp-content/mu-plugins` cannot be written, activation fails closed instead of silently running with reduced capture.
-
-## Recommended settings
-
-For a first production incident capture:
-
-```text
-Tracing:               ON
-Deep from request start: OFF
-Slow threshold:        1500 ms
-Callback detail floor: 5 ms
-Max log:               25 MB
-```
-
-If the automatic capture identifies an expensive hook but callback coverage started too late, repeat the request briefly with **Deep from request start** enabled.
-
-## Reading a slow request
-
-A useful order is:
-
-1. `classification`
-2. wall / CPU ratio
-3. `hook_profile.top_hooks`
-4. `hook_profile.top_owners`
-5. `hook_profile.top_callbacks`
-6. lifecycle phases
-7. SQL attribution
-8. outbound HTTP
-9. process I/O/resource deltas
-10. live PID tooling if still needed
-
-Always check the coverage fields before concluding that missing callback/SQL detail means no work occurred there.
-
-## Security and privacy
-
-The tracer avoids arbitrary POST-body capture and full query-string logging.
-
-Runtime logs live under:
-
-```text
-wp-content/rocket-request-tracer/
-```
-
-The active trace file:
-
-- uses a randomized name
-- uses a `.php` extension
-- starts with `exit; __halt_compiler();`
-- receives an `.htaccess` deny rule
-- is downloadable only through a capability/nonce-protected admin action
-
-Treat trace output as sensitive diagnostic data and clear it after the investigation.
-
-## Important limitations
-
-- This is application instrumentation, not a kernel profiler.
-- Automatic callback timing cannot retroactively recover callbacks that completed before the threshold was crossed.
-- Whole-hook timing is inclusive and can include nested hook work.
-- Exact callback rows are also inclusive and can double-count nested work when aggregating across call layers.
-- Direct database/network calls that bypass WordPress APIs may require host-level tracing.
-- `phpspy`/`strace` still require server-level permissions.
-
-## Documentation
-
-- [`docs/architecture.md`](docs/architecture.md)
-- [`docs/slow-hook-profiling.md`](docs/slow-hook-profiling.md)
-- [`SECURITY.md`](SECURITY.md)
-- [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Roadmap
 
-Remaining likely directions include:
+The immediate roadmap intentionally focuses on richer raw diagnostic evidence rather than an incident-report generator.
 
-- repeated request/query fingerprint grouping
-- incident-report generation
-- CLI companion for active PIDs
-- optional host-side `phpspy` integration
+Potential next foundations include:
+
 - MySQL connection/process correlation
-- configurable trace scopes
-- WP-CLI/cron-specific analysis modes
-- before/after mitigation comparison
+- richer active-PID host integration
+- request-fingerprint trend windows
+- configurable retention and sampling strategies
+- Redis/object-cache attribution
 
 ## Development status
 
-Request Monitor is experimental production diagnostics software. Validate releases on staging or a controlled site before broad deployment.
+This is an experimental production diagnostic tool, not a permanent APM replacement. Keep tracing disabled when it is not needed and use Deep mode for controlled investigation windows.
