@@ -55,7 +55,7 @@ final class Request_Monitor_Hook_Profiler {
 
         $now = self::now_ms();
         self::$seen_hooks[$hook] = true;
-        self::$hook_starts[$hook][] = hrtime(true);
+        self::$hook_starts[$hook][] = self::clock_ns();
 
         self::ensure_end_sentinel($hook);
 
@@ -79,7 +79,7 @@ final class Request_Monitor_Hook_Profiler {
         }
 
         $start_ns = array_pop(self::$hook_starts[$hook]);
-        $duration_ms = (hrtime(true) - $start_ns) / 1000000;
+        $duration_ms = (self::clock_ns() - $start_ns) / 1000000;
 
         if (!isset(self::$hooks[$hook])) {
             self::$hooks[$hook] = array(
@@ -169,16 +169,19 @@ final class Request_Monitor_Hook_Profiler {
                 if ($meta['owner'] === 'plugin:request-monitor' || $meta['owner'] === 'mu-plugin:request-monitor-bootstrap.php' || $meta['owner'] === 'mu-plugin:request-monitor-hook-profiler.php') {
                     continue;
                 }
+                if (!empty($meta['file']) && basename($meta['file']) === 'rocket-request-tracer.php') {
+                    continue;
+                }
 
                 $original = $entry['function'];
                 $callback_key = substr(hash('sha256', $hook . '|' . $priority . '|' . $id . '|' . $meta['callable']), 0, 20);
                 $wrapper = function () use ($original, $meta, $callback_key, $hook, $priority) {
                     $args = func_get_args();
-                    $start = hrtime(true);
+                    $start = Request_Monitor_Hook_Profiler::clock_for_wrapper();
                     try {
                         return call_user_func_array($original, $args);
                     } finally {
-                        $duration_ms = (hrtime(true) - $start) / 1000000;
+                        $duration_ms = (Request_Monitor_Hook_Profiler::clock_for_wrapper() - $start) / 1000000;
                         Request_Monitor_Hook_Profiler::record_callback($callback_key, $hook, $priority, $meta, $duration_ms);
                     }
                 };
@@ -189,6 +192,17 @@ final class Request_Monitor_Hook_Profiler {
             unset($entry);
         }
         unset($callbacks);
+    }
+
+    public static function clock_for_wrapper() {
+        return self::clock_ns();
+    }
+
+    private static function clock_ns() {
+        if (function_exists('hrtime')) {
+            return hrtime(true);
+        }
+        return (int) round(microtime(true) * 1000000000);
     }
 
     public static function record_callback($key, $hook, $priority, $meta, $duration_ms) {
@@ -240,7 +254,7 @@ final class Request_Monitor_Hook_Profiler {
     private static function is_our_callback($callback) {
         if (is_array($callback) && count($callback) === 2) {
             $class = is_object($callback[0]) ? get_class($callback[0]) : (string) $callback[0];
-            return $class === __CLASS__;
+            return $class === __CLASS__ || $class === 'Rocket_Request_Tracer';
         }
         return false;
     }
