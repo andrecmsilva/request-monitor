@@ -27,7 +27,7 @@ Requests are grouped by stable pattern fingerprint and summarized by:
 
 ### PHP callbacks
 
-Hook profiles are combined across completed requests. Callback identity includes owner, callable, hook, priority and source location.
+Hook profiles are combined across completed requests. In `hooks` and `deep`, eligible plugin/theme callbacks are timed from request start. Callback identity includes owner, callable, hook, priority and source location.
 
 The profiler measures the registered WordPress callback boundary. It does not continuously sample arbitrary nested PHP functions inside that callback.
 
