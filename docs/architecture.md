@@ -8,7 +8,7 @@ MU bootstrap admission gate
 request identity + PID + resource baseline
         ↓
 Deep: request-local SAVEQUERIES=true
-Hooks/Deep: hook profiler
+Hooks/Deep: callback timing from request start
         ↓
 START
         ↓
@@ -29,7 +29,7 @@ Store pairs START + END
 Analyzer
   ├─ workload fingerprints
   ├─ CPU demand
-  ├─ callback + owner aggregation
+  ├─ callback + owner + hook aggregation
   ├─ SQL fingerprints + caller stacks
   ├─ HTTP dependencies
   ├─ lifecycle hotspots
@@ -41,9 +41,17 @@ CLI analysis / inspect
 
 ## Safety boundary
 
-The 5–300 second absolute capture deadline remains authoritative. A request admitted before the deadline may finish and write END afterward, but requests starting after expiry are not instrumented.
+The absolute capture deadline remains authoritative. `light` allows 5–300 seconds, `hooks` 5–60 seconds, and `deep` 5–30 seconds. A request admitted before the deadline may finish and write END afterward, but requests starting after expiry are not instrumented.
 
 `SAVEQUERIES` is defined inside an admitted PHP request only. It therefore dies with the request and is not a persistent site setting.
+
+Outside a capture, the MU bootstrap returns before loading runtime or profiler helpers.
+
+## Profile behavior
+
+- `light`: request/PID/resource/fingerprint evidence only.
+- `hooks`: eligible plugin/theme callbacks and whole hooks are timed from request start. SQL retention begins only if the request crosses the slow threshold.
+- `deep`: callback timing and SQL retention begin from the earliest MU stage available to Request Monitor.
 
 ## PHP stack scope
 
