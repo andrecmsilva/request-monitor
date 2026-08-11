@@ -123,7 +123,7 @@ $GLOBALS['rrt_bootstrap_context']=array(
 );
 
 if($rrt_profile!=='light'&&class_exists('Request_Monitor_Hook_Profiler',false)){
-    Request_Monitor_Hook_Profiler::start($start,$slow_threshold_ms,$callback_floor_ms,$rrt_profile==='deep');
+    Request_Monitor_Hook_Profiler::start($start,$slow_threshold_ms,$callback_floor_ms,$rrt_profile);
 }
 
 rrt_mu_write(array(
