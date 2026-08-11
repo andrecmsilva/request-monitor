@@ -1,64 +1,74 @@
-# Snapshot and WP-CLI workflow
+# WP-CLI
 
-Request Monitor v0.6 is snapshot-only.
-
-## First-line capture
+## Capture
 
 ```bash
 wp request-monitor capture 30s
-```
-
-Default profile: `light`. The command clears the previous trace, opens a 30-second admission window, waits, closes it, then prints fingerprints.
-
-## Profiles
-
-```bash
-wp request-monitor capture 30s --profile=light
 wp request-monitor capture 30s --profile=hooks
 wp request-monitor capture 20s --profile=deep
 ```
 
-Use `light` first.
+Valid profiles are exactly `light`, `hooks`, and `deep`. Invalid values fail.
 
-## Self-expiring no-wait capture
+`capture` waits by default, then runs root-cause analysis automatically.
+
+Fire-and-forget:
 
 ```bash
 wp request-monitor capture 60s --no-wait
 ```
 
-The timestamp expires even if SSH disconnects.
-
 Later:
 
 ```bash
-wp request-monitor status
-wp request-monitor fingerprints --session=last --min-count=1
+wp request-monitor analyze --session=last
 ```
 
-## Stop early
+## Analyze
 
 ```bash
-wp request-monitor stop
+wp request-monitor analyze --session=last
+wp request-monitor analyze --session=last --format=json
 ```
 
-## Status
+## Inspect a fingerprint
 
 ```bash
-wp request-monitor status
-wp request-monitor status --format=json
+wp request-monitor inspect <fingerprint> --session=last
 ```
 
-States are only `idle` and `capturing`.
+This filters callback, SQL, HTTP, lifecycle and request evidence to matching request/pattern/query fingerprints and prints additional representative stacks.
 
-## Scopes
+## Scope
 
 ```bash
+wp request-monitor scope get
+wp request-monitor scope reset
 wp request-monitor scope set \
   --types=front,ajax,rest \
   --methods=GET,POST \
-  --include-paths='/shop/*,/furniture/*'
+  --include-paths='/shop/*,/furniture/*' \
+  --exclude-paths='/shop/private/*' \
+  --include-actions='wc_*,product_filter_*' \
+  --exclude-actions='heartbeat'
 ```
 
-## Continuous mode removed
+## Raw fingerprint grouping
 
-`wp request-monitor enable` and `wp request-monitor deep on` intentionally fail and explain the bounded capture syntax.
+```bash
+wp request-monitor fingerprints --session=last --mode=pattern --sort=cpu --min-count=1
+wp request-monitor fingerprints --session=last --mode=request --sort=wall
+wp request-monitor fingerprints --session=last --mode=query --sort=count
+wp request-monitor fingerprints --session=last --mode=query-shape --sort=count
+```
+
+## Operations
+
+```bash
+wp request-monitor status
+wp request-monitor active --session=last
+wp request-monitor stop
+wp request-monitor clear
+wp request-monitor export --file=/tmp/request-monitor.jsonl
+wp request-monitor repair
+```
