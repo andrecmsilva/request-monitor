@@ -10,6 +10,12 @@ wp request-monitor capture 20s --profile=deep
 
 Valid profiles are exactly `light`, `hooks`, and `deep`. Invalid values fail.
 
+Profile safety caps:
+
+- `light`: 5–300 seconds
+- `hooks`: 5–60 seconds
+- `deep`: 5–30 seconds
+
 `capture` waits by default, then runs root-cause analysis automatically.
 
 Fire-and-forget:
