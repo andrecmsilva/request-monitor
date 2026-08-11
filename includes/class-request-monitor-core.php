@@ -87,10 +87,12 @@ final class Request_Monitor_Core {
     public static function valid_profiles(){return array('light','hooks','deep');}
     public static function validate_profile($profile){$profile=strtolower(trim((string)$profile));return in_array($profile,self::valid_profiles(),true)?$profile:null;}
     public static function normalize_profile($profile){$valid=self::validate_profile($profile);return $valid!==null?$valid:'light';}
+    public static function profile_max_seconds($profile){return $profile==='deep'?30:($profile==='hooks'?60:self::MAX_CAPTURE_SECONDS);}
     public static function start_capture($seconds,$profile='light'){
         $seconds=(int)$seconds;
-        if($seconds<self::MIN_CAPTURE_SECONDS||$seconds>self::MAX_CAPTURE_SECONDS)return new WP_Error('rrt_capture_duration',sprintf('Capture duration must be between %d and %d seconds.',self::MIN_CAPTURE_SECONDS,self::MAX_CAPTURE_SECONDS));
         $profile=self::validate_profile($profile);if($profile===null)return new WP_Error('rrt_capture_profile','Invalid profile. Use one of: light, hooks, deep.');
+        $profile_max=self::profile_max_seconds($profile);
+        if($seconds<self::MIN_CAPTURE_SECONDS||$seconds>$profile_max)return new WP_Error('rrt_capture_duration',sprintf('%s capture duration must be between %d and %d seconds.',$profile,self::MIN_CAPTURE_SECONDS,$profile_max));
         $r=self::install_mu();if(is_wp_error($r))return $r;
         update_option(self::OPT_ENABLED,0,false);update_option(self::OPT_DEEP,0,false);
         $started=time();$until=$started+$seconds;
