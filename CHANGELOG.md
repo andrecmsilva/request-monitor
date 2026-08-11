@@ -9,8 +9,8 @@
 - Added bounded PHP `debug_backtrace()` capture for slow SQL queries through `log_query_custom_data`.
 - Added configurable slow-SQL stack threshold (default 10 ms).
 - Added aggregate plugin/theme callback timing across requests and fingerprints.
-- Added aggregate plugin/theme owner timing.
-- Added aggregate WordPress hook timing.
+- `hooks` now times eligible application callbacks from request start instead of waiting for the slow threshold.
+- Added aggregate plugin/theme owner timing and WordPress hook timing.
 - Added outbound HTTP grouping by endpoint, owner and caller, including representative caller stacks.
 - Added WordPress lifecycle hotspot aggregation.
 - Added slowest individual request output.
@@ -21,7 +21,8 @@
 - Added `wp request-monitor inspect <fingerprint> --session=last`.
 - `capture` now automatically runs analysis when a waited snapshot finishes.
 - Invalid profiles now fail instead of silently falling back to `light`.
-- Kept the v0.6 bounded 5–300 second safety model and idle fast path.
+- Added explicit exclusion of Request Monitor's own admin management requests from active captures.
+- Preserved bounded snapshot expiry and tightened heavy-profile caps: light ≤300s, hooks ≤60s, deep ≤30s.
 - No host-level PHP stack adapter was added.
 
 ## 0.6.0
