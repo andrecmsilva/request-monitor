@@ -3,21 +3,23 @@
 if (!defined('ABSPATH') || class_exists('Request_Monitor_Hook_Profiler', false)) return;
 
 final class Request_Monitor_Hook_Profiler {
-    private static $started=false,$request_start=0.0,$slow_threshold_ms=1500.0,$callback_floor_ms=5.0,$deep=false,$callback_armed=false,$callback_started_ms=null;
+    private static $started=false,$request_start=0.0,$slow_threshold_ms=1500.0,$callback_floor_ms=5.0,$profile='hooks',$callback_armed=false,$callback_started_ms=null,$sql_escalated=false;
     private static $hook_starts=array(),$hooks=array(),$callbacks=array(),$owners=array(),$wrapped=array(),$skipped_reference=array(),$seen_hooks=array();
     private static $max_callback_rows=300;
 
-    public static function start($request_start,$slow_threshold_ms,$callback_floor_ms,$deep){
+    public static function start($request_start,$slow_threshold_ms,$callback_floor_ms,$profile){
         if(self::$started||!function_exists('add_action'))return;
-        self::$started=true;self::$request_start=(float)$request_start;self::$slow_threshold_ms=max(250.0,(float)$slow_threshold_ms);self::$callback_floor_ms=max(0.1,(float)$callback_floor_ms);self::$deep=(bool)$deep;
-        if(self::$deep)self::arm_callback_timing(0.0,'deep');
+        self::$started=true;self::$request_start=(float)$request_start;self::$slow_threshold_ms=max(250.0,(float)$slow_threshold_ms);self::$callback_floor_ms=max(0.1,(float)$callback_floor_ms);
+        self::$profile=in_array($profile,array('hooks','deep'),true)?$profile:'hooks';
+        // Bounded hooks/deep captures exist specifically to attribute callbacks, so time them from request start.
+        self::arm_callback_timing(0.0,'profile_start');
         add_action('all',array(__CLASS__,'observe_hook_entry'),PHP_INT_MIN,1);
     }
 
     public static function observe_hook_entry(){
         if(!self::$started||!function_exists('current_filter'))return;$hook=current_filter();if(!$hook||$hook==='all')return;
         $now=self::now_ms();self::$seen_hooks[$hook]=true;self::$hook_starts[$hook][]=self::clock_ns();self::ensure_end_sentinel($hook);
-        if(!self::$callback_armed&&$now>=self::$slow_threshold_ms)self::arm_callback_timing($now,'threshold');
+        self::maybe_escalate_sql($now);
         if(self::$callback_armed)self::wrap_hook_callbacks($hook);
     }
     public static function finish_hook($value=null){
@@ -25,17 +27,25 @@ final class Request_Monitor_Hook_Profiler {
         $start_ns=array_pop(self::$hook_starts[$hook]);$duration_ms=(self::clock_ns()-$start_ns)/1000000;
         if(!isset(self::$hooks[$hook]))self::$hooks[$hook]=array('hook'=>$hook,'count'=>0,'total_ms'=>0.0,'max_ms'=>0.0);
         self::$hooks[$hook]['count']++;self::$hooks[$hook]['total_ms']+=$duration_ms;self::$hooks[$hook]['max_ms']=max(self::$hooks[$hook]['max_ms'],$duration_ms);
-        $elapsed=self::now_ms();if(!self::$callback_armed&&$elapsed>=self::$slow_threshold_ms)self::arm_callback_timing($elapsed,'threshold_after_hook');return $value;
+        self::maybe_escalate_sql(self::now_ms());return $value;
     }
     private static function ensure_end_sentinel($hook){remove_filter($hook,array(__CLASS__,'finish_hook'),PHP_INT_MAX);add_filter($hook,array(__CLASS__,'finish_hook'),PHP_INT_MAX,1);}
 
     private static function arm_callback_timing($elapsed_ms,$reason){
         if(self::$callback_armed)return;self::$callback_armed=true;self::$callback_started_ms=round((float)$elapsed_ms,3);
         if(!empty($GLOBALS['rrt_bootstrap_context'])&&is_array($GLOBALS['rrt_bootstrap_context'])){
-            $GLOBALS['rrt_bootstrap_context']['auto_escalated']=!self::$deep;
-            $GLOBALS['rrt_bootstrap_context']['auto_escalated_at_ms']=self::$callback_started_ms;
-            $GLOBALS['rrt_bootstrap_context']['auto_escalation_reason']=$reason;
-            if(!defined('SAVEQUERIES'))define('SAVEQUERIES',true);
+            $GLOBALS['rrt_bootstrap_context']['callback_timing_started_ms']=self::$callback_started_ms;
+            $GLOBALS['rrt_bootstrap_context']['callback_timing_reason']=$reason;
+        }
+    }
+    private static function maybe_escalate_sql($elapsed_ms){
+        if(self::$profile!=='hooks'||self::$sql_escalated||$elapsed_ms<self::$slow_threshold_ms)return;
+        self::$sql_escalated=true;
+        if(!defined('SAVEQUERIES'))define('SAVEQUERIES',true);
+        if(!empty($GLOBALS['rrt_bootstrap_context'])&&is_array($GLOBALS['rrt_bootstrap_context'])){
+            $GLOBALS['rrt_bootstrap_context']['auto_escalated']=true;
+            $GLOBALS['rrt_bootstrap_context']['auto_escalated_at_ms']=round((float)$elapsed_ms,3);
+            $GLOBALS['rrt_bootstrap_context']['auto_escalation_reason']='slow_threshold_sql';
             $GLOBALS['rrt_bootstrap_context']['savequeries_enabled']=defined('SAVEQUERIES')&&SAVEQUERIES;
             if(defined('SAVEQUERIES')&&!SAVEQUERIES)$GLOBALS['rrt_bootstrap_context']['savequeries_reason']='SAVEQUERIES already defined false';
         }
@@ -80,7 +90,7 @@ final class Request_Monitor_Hook_Profiler {
         $hooks=array_values(self::$hooks);usort($hooks,function($a,$b){return $b['total_ms']<=>$a['total_ms'];});foreach($hooks as &$h){$h['total_ms']=round($h['total_ms'],3);$h['max_ms']=round($h['max_ms'],3);}unset($h);
         $callbacks=array_values(self::$callbacks);usort($callbacks,function($a,$b){return $b['total_ms']<=>$a['total_ms'];});foreach($callbacks as &$c){$c['total_ms']=round($c['total_ms'],3);$c['max_ms']=round($c['max_ms'],3);}unset($c);
         $owners=array_values(self::$owners);usort($owners,function($a,$b){return $b['total_ms']<=>$a['total_ms'];});foreach($owners as &$o){$o['total_ms']=round($o['total_ms'],3);$o['max_ms']=round($o['max_ms'],3);}unset($o);
-        $report=array('mode'=>self::$deep?'deep_from_start':'auto_threshold','slow_threshold_ms'=>self::$slow_threshold_ms,'callback_floor_ms'=>self::$callback_floor_ms,'callback_timing_armed'=>self::$callback_armed,'callback_timing_started_ms'=>self::$callback_started_ms,'hooks_seen'=>count(self::$seen_hooks),'hooks_timed'=>count(self::$hooks),'timed_callback_rows'=>count(self::$callbacks),'skipped_by_reference'=>count(self::$skipped_reference));
+        $report=array('mode'=>self::$profile==='deep'?'deep_callbacks_from_start':'hooks_callbacks_from_start','slow_threshold_ms'=>self::$slow_threshold_ms,'callback_floor_ms'=>self::$callback_floor_ms,'callback_timing_armed'=>self::$callback_armed,'callback_timing_started_ms'=>self::$callback_started_ms,'sql_escalated'=>self::$sql_escalated,'hooks_seen'=>count(self::$seen_hooks),'hooks_timed'=>count(self::$hooks),'timed_callback_rows'=>count(self::$callbacks),'skipped_by_reference'=>count(self::$skipped_reference));
         if($include_details){$report['top_hooks']=array_slice($hooks,0,40);$report['top_callbacks']=array_slice($callbacks,0,60);$report['top_owners']=array_slice($owners,0,30);$report['skipped_reference_callbacks']=array_slice(array_values(self::$skipped_reference),0,20);}return $report;
     }
 }
