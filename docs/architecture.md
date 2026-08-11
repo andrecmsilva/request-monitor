@@ -1,69 +1,110 @@
 # Architecture
 
-## v0.5 request path
+## v0.6 snapshot path
 
 ```text
-incoming request / WP-CLI workload
-        ↓
-MU runtime classifies request type and evaluates trace scope
-        ↓ allowed
+IDLE request
+    ↓
+mandatory MU bootstrap
+    ↓
+read rrt_capture_until
+    ↓ expired / unset
+return immediately
+```
+
+During an active capture:
+
+```text
+incoming request
+    ↓
+MU bootstrap validates absolute capture deadline
+    ↓ active
+load lightweight runtime
+    ↓
+classify request type + evaluate trace scope
+    ↓ allowed
 fingerprints + request identity + resource baseline
-        ↓
+    ↓
 MU START record
-        ↓
-hook profiler / slow escalation
-        ↓
-normal Request Monitor plugin enrichment
-        ↓
+    ↓
+normal Request Monitor enrichment
+    ↓
+optional hook profiler only for hooks/deep profile
+    ↓
 MU shutdown
-        ↓
-END record with CPU/wall/I/O/hooks/SQL/HTTP
-        ↓
-store pairs START + END
-        ↓
+    ↓
+END record
+    ↓
+store pairs START + END by request/session
+    ↓
 fingerprint aggregation / CLI / admin UI
 ```
 
+## Capture lifecycle
+
+There is no persistent monitoring-enabled state in v0.6.
+
+`rrt_capture_until` is an absolute Unix timestamp. New requests are admitted only while that value is greater than the current time. This makes capture expiry independent of WP-Cron, a browser session, or the WP-CLI process that initiated it.
+
+Already-admitted requests keep their in-memory context and may write END after the deadline. Expiry blocks new admission; it does not truncate requests that are already executing.
+
+Capture windows are hard-limited to 5–300 seconds.
+
+## Profiles
+
+### `light`
+
+Default. Does not load the global hook profiler. Captures request/PID identity, fingerprints, Cloudflare metadata, CPU/wall/memory/resource deltas, lifecycle timing and WordPress context.
+
+### `hooks`
+
+Loads hook timing during the bounded window and can arm eligible plugin/theme callback timing after the slow threshold.
+
+### `deep`
+
+Loads hook/callback profiling and SQL retention from request start. Intended for the shortest targeted windows.
+
+## Idle behavior
+
+While idle the MU bootstrap performs the capture-deadline option lookup and timestamp comparison, then returns before loading runtime or profiler helpers.
+
+For ordinary frontend traffic, the normal plugin also has a fast path: when the current MU foundation is loaded and no trace context exists, it returns before loading its core/store/admin classes.
+
 ## Modules
-
-### `mu/request-monitor-runtime.php`
-
-Low-level utilities available before the normal plugin:
-
-- resource snapshots
-- safe query handling
-- path normalization and pattern templating
-- request/query fingerprint creation helpers
-- request-type detection
-- scope parsing/matching
-- log storage/rotation
-- lifecycle utility functions
 
 ### `mu/request-monitor-bootstrap.php`
 
-Owns trace START/END and the shared request context.
+Owns the capture-deadline gate and traced request START/END lifecycle.
 
-It rejects requests outside the configured scope before creating a trace.
+### `mu/request-monitor-runtime.php`
+
+Loaded only during an active capture. Provides resource snapshots, fingerprinting, request classification, scope matching and trace storage.
 
 ### `mu/request-monitor-hook-profiler.php`
 
-Owns whole-hook timing and safe plugin/theme callback timing after automatic slow escalation or from request start in Deep mode.
+Loaded only for `hooks` or `deep` captures. Owns whole-hook timing and safe plugin/theme callback timing.
 
 ### `includes/class-request-monitor-core.php`
 
-Owns WordPress-aware enrichment, settings, mandatory MU install/repair and lifecycle integration.
+Owns bounded capture sessions, upgrade safety, MU install/repair, scopes and WordPress-aware enrichment.
 
 ### `includes/class-request-monitor-store.php`
 
-Reads trace records, pairs START/END events and aggregates fingerprint groups.
+Reads START/END records, filters by capture session and aggregates fingerprint groups.
 
 ### `includes/class-request-monitor-cli.php`
 
-Provides operational control without wp-admin.
+Primary operational control plane. `capture` opens a bounded window; `stop` closes it early.
 
 ### `includes/class-request-monitor-admin.php`
 
-Provides an optional visual interface; it is not required for incident operation.
+Optional visual interface exposing bounded snapshot controls only.
+
+## Upgrade safety
+
+A v0.5 installation may have legacy continuous options set. On the first v0.6 load, Request Monitor forcibly clears those legacy states, closes the capture deadline, installs the current MU files, and stores the v0.6 schema/version marker.
+
+This migration does not rely on the plugin activation hook, because WordPress updates an already-active plugin without re-running activation.
 
 ## Fingerprinting
 
@@ -74,18 +115,21 @@ Four identifiers are written at START and propagated to END:
 - query fingerprint
 - query-shape fingerprint
 
-Client IP, User-Agent and CF-Ray are intentionally not part of these fingerprints. The goal is to group application workload independent of who generated it.
-
-## Scope evaluation
-
-Scope filtering occurs in the MU layer before resource tracing begins. This keeps narrow incident captures narrow at the source instead of collecting everything and filtering afterward.
-
-Request Monitor's own WP-CLI commands are always excluded. Other WP-CLI workloads are eligible when `cli` is included in scope.
+Client IP, User-Agent and CF-Ray are intentionally not part of these fingerprints. Pattern normalization templates numeric IDs, UUIDs and long hexadecimal identifiers without collapsing ordinary long WordPress slugs.
 
 ## Operational principle
 
-The dashboard is a viewer, not a dependency. During a saturated server incident the preferred control plane is:
+Request Monitor is a short-lived diagnostic instrument, not an APM agent.
+
+Preferred first-line use:
 
 ```bash
-wp request-monitor ...
+wp request-monitor capture 30s
+```
+
+Escalate only when needed:
+
+```bash
+wp request-monitor capture 20s --profile=hooks
+wp request-monitor capture 15s --profile=deep
 ```

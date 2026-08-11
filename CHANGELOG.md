@@ -1,33 +1,36 @@
 # Changelog
 
+## 0.6.0
+
+- Removed continuous tracing as an operational mode.
+- Added mandatory bounded capture sessions with absolute expiry timestamps.
+- Added `wp request-monitor capture 30s` and `snapshot 30s`.
+- Added hard duration limits of 5–300 seconds.
+- Added automatic expiry independent of SSH, WP-Cron, or a running CLI process.
+- Added `light`, `hooks`, and `deep` profiles.
+- Made `light` the default and stopped loading the hook profiler in light snapshots.
+- Reduced the idle MU path to one capture-expiry lookup and immediate return.
+- Stopped loading MU runtime/profiler helpers while idle.
+- Added capture session IDs to START/END records and fingerprint aggregation.
+- Added `--session=last` fingerprint queries.
+- Added `--no-wait` self-expiring captures.
+- Added `wp request-monitor stop`; `disable` is a safety alias.
+- Made old `enable` and persistent `deep` commands fail with bounded-capture guidance.
+- Default captures clear the previous log so results describe the snapshot window.
+- Refined path normalization so ordinary long WordPress slugs are no longer converted to `{token}`.
+- Updated wp-admin to expose bounded snapshot controls only.
+
 ## 0.5.0
 
-- Added stable request fingerprints for concrete method/path/action/query combinations.
-- Added pattern fingerprints with numeric, UUID, long-hex and token path templating.
-- Added query-value and query-shape fingerprints without persisting arbitrary raw query values.
-- Added repeated fingerprint aggregation by count, slow requests, CPU-bound count, wall time, CPU time and memory.
-- Added configurable MU-level trace scopes for request type, method, include/exclude paths and AJAX/WooCommerce actions.
-- Added opt-in tracing for arbitrary WP-CLI workloads through the `cli` request type.
-- Hard-excluded Request Monitor's own WP-CLI commands from tracing.
-- Added `wp request-monitor` commands for status, enable/disable, Deep mode, scope control, active requests, fingerprints, clear, export and MU repair.
-- Added CLI-first operational documentation.
-- Split the normal plugin into core, store, admin and CLI modules.
-- Split reusable MU runtime helpers from the bootstrap for a smaller tracing entry point.
-- Removed incident-report generation from the immediate roadmap; raw diagnostic evidence remains the project focus.
+- Added request/query fingerprint grouping, trace scopes, and WP-CLI control.
 
 ## 0.4.0
 
-- Added configurable automatic slow-request escalation.
-- Added continuous whole-hook timing.
-- Added eligible plugin/theme callback timing after threshold and from request start in Deep mode.
-- Added callback owner/file/callable attribution with by-reference safety exclusions.
-- Added explicit SQL/HTTP coverage metadata for basic, post-threshold and Deep captures.
+- Added slow escalation and hook/callback timing.
 
 ## 0.3.0
 
-- Made the MU bootstrap mandatory.
-- Moved START/END ownership into the MU layer.
-- Added lifecycle phase timing and automatic MU installation/repair.
+- Made the MU tracing foundation mandatory.
 
 ## 0.2.0
 
