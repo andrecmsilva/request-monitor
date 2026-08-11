@@ -1,5 +1,5 @@
 <?php
-/** Request Monitor MU runtime helpers. Version: 0.6.0 */
+/** Request Monitor MU runtime helpers. Version: 0.7.0 */
 if (!defined('ABSPATH') || defined('RRT_RUNTIME_LOADED')) return;
 define('RRT_RUNTIME_LOADED', true);
 
