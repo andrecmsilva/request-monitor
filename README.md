@@ -1,107 +1,111 @@
 # Request Monitor
 
-Request Monitor is a **bounded snapshot profiler** for WordPress/PHP worker incidents. It is intentionally **not a continuous monitoring tool**.
+Request Monitor is a **bounded snapshot profiler** for WordPress/PHP worker incidents. It is intentionally not a continuous monitoring agent.
 
-## Current version
+**Current version: 0.7.0**
 
-**0.6.0**
-
-The v0.6 safety model is:
-
-```text
-IDLE
-  ↓
-wp request-monitor capture 30s
-  ↓
-trace only requests beginning inside that 30-second window
-  ↓
-deadline expires automatically
-  ↓
-new requests are no longer instrumented
-  ↓
-fingerprint summary
-  ↓
-IDLE
-```
-
-If the initiating SSH/WP-CLI session disconnects, the capture still expires because the deadline is stored as an absolute Unix timestamp.
-
-## Idle cost
-
-The mandatory MU bootstrap remains installed, but when no snapshot is active it performs only one `get_option('rrt_capture_until')`, one timestamp comparison, then immediately returns.
-
-The runtime and hook-profiler files are **not loaded while idle**. There is no callback wrapping, `SAVEQUERIES`, log writing, START/END tracing, `/proc` sampling, or hook instrumentation outside an active window.
+v0.7 changes the primary question from **“what URL is expensive?”** to **“why is it expensive?”**.
 
 ## Install
 
 ```bash
-wp plugin install "https://github.com/andrecmsilva/request-monitor/releases/download/v0.6.0/request-monitor-v0.6.0.zip" --activate
+wp plugin install "https://github.com/andrecmsilva/request-monitor/releases/download/v0.7.0/request-monitor-v0.7.0.zip" --activate
 ```
 
-## Recommended first capture
+## Recommended workflow
+
+Start with a lightweight 30-second snapshot:
 
 ```bash
 wp request-monitor capture 30s
 ```
 
-The default `light` profile captures request/PID correlation, fingerprints, Cloudflare metadata, wall/CPU time, CPU-vs-wait classification, memory, `getrusage()`, `/proc/self/io`, lifecycle timing, and WordPress request context.
-
-It deliberately does **not** load the global hook profiler.
-
-At the end of the window, the command prints fingerprint groups sorted by aggregate CPU.
-
-## Profiles
+If the result identifies a workload worth profiling, escalate deliberately:
 
 ```bash
-wp request-monitor capture 30s --profile=light
 wp request-monitor capture 30s --profile=hooks
 wp request-monitor capture 20s --profile=deep
 ```
 
-| Profile | Intended use | Hook profiler | SQL |
-|---|---|---:|---:|
-| `light` | first-line snapshot | No | No |
-| `hooks` | callback investigation | Yes | after slow escalation |
-| `deep` | shortest targeted investigation | Yes, from start | from start |
+Capture windows are hard-bounded by profile: **light 5–300s, hooks 5–60s, deep 5–30s**. The expiry timestamp lives in WordPress, so a lost SSH session cannot leave tracing active.
 
-Use `light` first. Only escalate after the fingerprint output identifies a workload worth profiling.
+## What `capture` returns in v0.7
 
-## Hard safety limits
+The command now runs root-cause analysis automatically after the snapshot. The output includes:
 
-Capture duration is bounded to **5–300 seconds**.
+- completed/in-flight request counts
+- aggregate PHP CPU and estimated CPU-core demand during the capture
+- aggregate wall time and CPU share
+- measured WordPress SQL time
+- measured outbound HTTP time
+- residual/unattributed wait estimate
+- dominant request fingerprints
+- slowest individual requests
+- expensive AJAX/WooCommerce actions
+- top timed plugin/theme callbacks
+- top WordPress hooks
+- top plugin/theme owners
+- top normalized SQL fingerprints
+- SQL execution counts, total/average/max time and WordPress caller
+- bounded PHP backtraces for slow SQL queries
+- outbound HTTP endpoint/caller aggregation
+- WordPress lifecycle phase hotspots
+- concise conclusions and warnings
 
-Continuous mode has been removed. This now fails deliberately:
+## Profiles
+
+| Profile | Use | Hook/callback timing | SQL | HTTP |
+|---|---|---:|---:|---:|
+| `light` | first-line snapshot | No | No | No |
+| `hooks` | PHP callback investigation | from request start | after slow threshold | Yes |
+| `deep` | shortest root-cause capture | from request start | from MU bootstrap | Yes |
+
+### Deep SQL behavior
+
+Deep mode defines `SAVEQUERIES` **inside each traced PHP request** from the MU bootstrap. The constant disappears when that request ends, so it does not persist beyond the bounded snapshot.
+
+Request Monitor groups normalized query shapes and captures a bounded `debug_backtrace()` only for queries slower than the configurable threshold (default: `10 ms`).
+
+If `SAVEQUERIES` was already defined `false` by application configuration, PHP cannot redefine it. Request Monitor reports that explicitly instead of pretending SQL attribution succeeded.
+
+## PHP attribution
+
+The hook profiler times eligible plugin/theme callbacks and returns:
+
+- hook
+- priority
+- callable/class method
+- plugin/theme owner
+- source file + line
+- invocation count
+- aggregate and max callback time
+
+This is application callback attribution, not a continuously sampled Zend VM stack. v0.7 deliberately does **not** add a host-level stack adapter.
+
+## Analyze an existing capture
 
 ```bash
-wp request-monitor enable
+wp request-monitor analyze --session=last
+wp request-monitor analyze --session=last --format=json
 ```
 
-and directs you to a bounded capture instead.
-
-## Start and return immediately
+## Inspect one fingerprint
 
 ```bash
-wp request-monitor capture 60s --no-wait
+wp request-monitor inspect <fingerprint> --session=last
 ```
 
-The capture expires automatically even if the shell disconnects.
+`inspect` narrows PHP callback, SQL, HTTP, lifecycle, and request evidence to that fingerprint and prints more caller-stack detail.
 
-Check later:
+## Existing fingerprint view
 
 ```bash
-wp request-monitor status
-wp request-monitor fingerprints --session=last --min-count=1
+wp request-monitor fingerprints --session=last --mode=pattern --sort=cpu --min-count=1
 ```
 
-## Stop early
+Modes: `pattern`, `request`, `query`, `query-shape`.
 
-```bash
-wp request-monitor stop
-```
-
-`disable` remains only as a safety alias for `stop`.
-
-## Scopes
+## Trace scopes
 
 ```bash
 wp request-monitor scope set \
@@ -110,24 +114,52 @@ wp request-monitor scope set \
   --include-paths='/shop/*,/furniture/*'
 ```
 
-## Fingerprints
+Supported types: `front`, `admin`, `ajax`, `rest`, `cron`, `cli`.
 
-```bash
-wp request-monitor fingerprints \
-  --session=last \
-  --mode=pattern \
-  --sort=cpu \
-  --min-count=1
+Request Monitor's own WP-CLI and admin management actions are never traced.
+
+## Idle behavior
+
+Outside an active capture window:
+
+- the MU bootstrap checks only the absolute capture-expiry option and returns
+- the runtime helper is not loaded
+- the hook profiler is not loaded
+- no callback wrapping occurs
+- `SAVEQUERIES` is not enabled by Request Monitor
+- no request START/END records are written
+- no `/proc` or resource sampling occurs
+
+## Important interpretation note
+
+PHP CPU, SQL duration, and outbound HTTP duration are measured separately. The reported **residual/unattributed wait** is:
+
+```text
+max(0, wall - PHP CPU - SQL - HTTP)
 ```
 
-Modes: `pattern`, `request`, `query`, `query-shape`.
+It is a diagnostic estimate, not a perfect accounting identity. Timers can overlap. Residual time may include Redis/object-cache, filesystem, socket, lock, scheduler, or other waits.
 
-Sorts: `cpu`, `wall`, `count`, `max`.
+## CLI
 
-## Important expiry behavior
+```bash
+wp request-monitor status
+wp request-monitor capture 30s
+wp request-monitor capture 30s --profile=hooks
+wp request-monitor capture 20s --profile=deep
+wp request-monitor capture 60s --no-wait
+wp request-monitor analyze --session=last
+wp request-monitor inspect <fingerprint> --session=last
+wp request-monitor active --session=last
+wp request-monitor fingerprints --session=last
+wp request-monitor stop
+wp request-monitor clear
+wp request-monitor export --file=/tmp/request-monitor.jsonl
+wp request-monitor repair
+```
 
-The deadline stops **new request admission**. A request that began at second 29 of a 30-second capture is allowed to finish and write its END record after the deadline. Requests arriving after second 30 are not traced.
+Invalid profiles hard-fail. For example `--profile=hook` is rejected; use `--profile=hooks`.
 
 ## Development status
 
-Request Monitor remains experimental production diagnostics. v0.6 specifically changes the architecture so expensive instrumentation cannot be left enabled indefinitely by mistake.
+Request Monitor remains an experimental production diagnostic tool. Use `light` first, then run short `hooks` or `deep` captures only when the initial snapshot identifies a workload worth deeper attribution.
